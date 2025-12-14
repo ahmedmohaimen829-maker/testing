@@ -1,0 +1,723 @@
+-- Flame Ability ServerScript
+-- Place this in ServerScriptService
+--
+-- This script handles the server-side logic for the flame ability.
+-- It works for both players and NPCs (characters with Humanoid).
+--
+-- For NPCs: Use the BindableEvent to trigger the ability:
+--   ReplicatedStorage.RE.FlameAbilityNPC:Fire(character)
+
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local RunService = game:GetService("RunService")
+local Debris = game:GetService("Debris")
+local TweenService = game:GetService("TweenService")
+
+-- Wait for RemoteEvent
+local remoteEvent = ReplicatedStorage:WaitForChild("RE"):WaitForChild("FlameAbilityEvent")
+
+-- Configuration (must match client settings exactly)
+local COOLDOWN_TIME = 2 -- seconds
+local ANIMATION_ID = "80791375022267"
+local VFX_PATH = ReplicatedStorage:WaitForChild("VFX"):WaitForChild("FlameVFX")
+local VFX_OFFSET = Vector3.new(0, 0, -3.5)
+local VFX_DURATION = 1 -- Duration of VFX effect
+local VFX_DELAY_AFTER_ANIMATION = 0.45 -- Delay in seconds before VFX starts after animation begins
+
+-- Hitbox configuration (must match client settings)
+local HITBOX_SIZE = Vector3.new(5, 4.95, 11.71)
+local HITBOX_TRANSPARENCY = 1 -- Fully invisible (hitbox is functional but not visible)
+local HITBOX_FORWARD_OFFSET = 5.7 -- How much the hitbox extends forward from the Flame attachment (in studs)
+
+-- Damage configuration
+local DAMAGE_AMOUNT = 1 -- Damage per tick
+local DAMAGE_INTERVAL = 0.3 -- Seconds between damage ticks
+local SLOW_MULTIPLIER = 0.3 -- WalkSpeed multiplier (30% of original speed)
+local PUSHBACK_FORCE = 15 -- Initial force of pushback (studs/second) - how much the character gets pushed back on each hit
+local PUSHBACK_DURATION = 0.4 -- Duration of pushback effect (seconds) - how long the pushback lasts
+local PUSHBACK_FADE_TIME = 0.3 -- Time to fade out pushback smoothly (seconds) - must be less than PUSHBACK_DURATION
+
+-- Highlight configuration
+local HIGHLIGHT_FILL_TRANSPARENCY = 0.5 -- Less visible highlight (0 = fully visible, 1 = invisible)
+local HIGHLIGHT_FLICKER_IN_TIME = 0.03 -- Time to flicker to dark red (seconds) - faster = quicker flicker
+local HIGHLIGHT_FLICKER_OUT_TIME = 0.05 -- Time to return from dark red (seconds) - faster = quicker flicker
+
+-- Track cooldowns and states (works for both players and NPCs)
+-- For players: use player object as key
+-- For NPCs: use character as key
+local characterCooldowns = {}
+local characterActiveStates = {}
+local characterHitboxes = {} -- Track hitboxes per character/player
+local characterHitboxConnections = {} -- Track hitbox update connections per character/player (merged loop)
+
+-- Track characters affected by hitboxes (per ability owner)
+-- Structure: affectedCharacters[abilityOwner][targetCharacter] = {highlight, lastDamageTime, humanoid}
+-- For players: abilityOwner is player object, targetCharacter is player object
+-- For NPCs: abilityOwner is character, targetCharacter is character
+local affectedCharacters = {}
+
+-- Helper function to get identifier for a character (player or character itself for NPCs)
+local function getCharacterIdentifier(character)
+	local player = Players:GetPlayerFromCharacter(character)
+	return player or character -- Use player if exists, otherwise use character
+end
+
+-- Function to check if character can use ability (works for both players and NPCs)
+local function canUseAbility(characterIdentifier)
+	if characterCooldowns[characterIdentifier] and tick() < characterCooldowns[characterIdentifier] then
+		return false
+	end
+	if characterActiveStates[characterIdentifier] then
+		return false
+	end
+	return true
+end
+
+-- Function to replicate VFX to all clients
+local function replicateVFXToClients(character)
+	-- Fire to all clients so everyone can see the VFX
+	for _, otherPlayer in ipairs(Players:GetPlayers()) do
+		-- Fire to all players so they can see the VFX
+		remoteEvent:FireClient(otherPlayer, "ShowVFX", character)
+	end
+end
+
+-- Function to get all particle emitters recursively
+local function getAllParticleEmitters(instance)
+	local emitters = {}
+
+	local function searchRecursive(obj)
+		if obj:IsA("ParticleEmitter") then
+			table.insert(emitters, obj)
+		end
+
+		for _, child in ipairs(obj:GetChildren()) do
+			searchRecursive(child)
+		end
+	end
+
+	searchRecursive(instance)
+	return emitters
+end
+
+-- Server does NOT create VFX or emit particles
+-- VFX is client-authoritative - server only signals clients to play it
+
+-- Forward declarations (to avoid forward reference issues)
+local function applyHitboxEffects(abilityOwnerIdentifier, targetCharacterIdentifier, character, humanoid, hitbox) end
+local function removeHitboxEffects(abilityOwnerIdentifier, targetCharacterIdentifier) end
+local function flickerHighlight(highlight) end
+local function createHighlight(character) end
+local function getBaseWalkSpeed(humanoid) end
+local function applyPushback(targetCharacter, abilityOwnerCharacter, abilityOwnerRootPart) end
+
+-- Function to check for characters (players and NPCs) in hitbox, apply effects, and handle damage (merged into one loop)
+-- Defined here before createServerHitbox to avoid forward reference
+local function processHitbox(hitbox, abilityOwnerIdentifier, abilityOwnerCharacter, flameAttachment, humanoidRootPart)
+	if not hitbox or not hitbox.Parent then
+		return false -- Signal to disconnect
+	end
+
+	if not abilityOwnerCharacter or not abilityOwnerCharacter.Parent then
+		return false
+	end
+
+	if not flameAttachment or not flameAttachment.Parent then
+		return false
+	end
+
+	if not humanoidRootPart or not humanoidRootPart.Parent then
+		return false
+	end
+
+	-- Update hitbox position (merged from position update loop)
+	local attachmentWorldCFrame = flameAttachment.WorldCFrame
+	local cf = humanoidRootPart.CFrame
+	local lookVector = cf.LookVector
+	local hitboxPosition = attachmentWorldCFrame.Position + (lookVector * HITBOX_FORWARD_OFFSET)
+	hitbox.CFrame = CFrame.new(hitboxPosition) * (cf - cf.Position)
+
+	-- Check for characters (players and NPCs) in hitbox (merged from check loop)
+	local overlapParams = OverlapParams.new()
+	overlapParams.FilterType = Enum.RaycastFilterType.Blacklist
+	overlapParams.FilterDescendantsInstances = {abilityOwnerCharacter}
+
+	local hitboxCFrame = hitbox.CFrame
+	local hitboxSize = hitbox.Size
+	local partsInBox = workspace:GetPartBoundsInBox(hitboxCFrame, hitboxSize, overlapParams)
+
+	-- Track which characters we've found (using identifier)
+	local foundCharacters = {}
+	local currentTime = tick()
+
+	-- Check each part and apply effects
+	for _, part in ipairs(partsInBox) do
+		local character = part.Parent
+		if character and character:FindFirstChild("Humanoid") then
+			local targetIdentifier = getCharacterIdentifier(character)
+
+			-- Don't affect the ability owner
+			if targetIdentifier ~= abilityOwnerIdentifier and not foundCharacters[targetIdentifier] then
+				foundCharacters[targetIdentifier] = true
+
+				local humanoid = character:FindFirstChild("Humanoid")
+				if humanoid and humanoid.Health > 0 then
+					-- Apply effects if not already applied
+					applyHitboxEffects(abilityOwnerIdentifier, targetIdentifier, character, humanoid, hitbox)
+
+					-- Apply damage at intervals (merged from damage loop)
+					local data = affectedCharacters[abilityOwnerIdentifier] and affectedCharacters[abilityOwnerIdentifier][targetIdentifier]
+					if data and (currentTime - data.lastDamageTime >= DAMAGE_INTERVAL) then
+						data.lastDamageTime = currentTime
+						humanoid.Health = humanoid.Health - DAMAGE_AMOUNT
+						flickerHighlight(data.highlight)
+
+						-- Apply smooth pushback effect
+						applyPushback(character, abilityOwnerCharacter, humanoidRootPart)
+					end
+				end
+			end
+		end
+	end
+
+	-- Remove effects from characters no longer in hitbox
+	if affectedCharacters[abilityOwnerIdentifier] then
+		for targetIdentifier, _ in pairs(affectedCharacters[abilityOwnerIdentifier]) do
+			if not foundCharacters[targetIdentifier] then
+				removeHitboxEffects(abilityOwnerIdentifier, targetIdentifier)
+			end
+		end
+	end
+
+	return true -- Continue loop
+end
+
+-- Create hitbox on server side (returns hitbox and merged connection)
+local function createServerHitbox(character, humanoidRootPart, abilityOwnerIdentifier)
+	-- Find or create Flame attachment
+	local flameAttachment = humanoidRootPart:FindFirstChild("Flame")
+	if not flameAttachment then
+		-- Create a temporary attachment if it doesn't exist (for positioning)
+		flameAttachment = Instance.new("Attachment")
+		flameAttachment.Name = "Flame"
+		flameAttachment.Position = VFX_OFFSET
+		flameAttachment.Parent = humanoidRootPart
+	end
+
+	-- Create hitbox part (invisible but functional)
+	local hitbox = Instance.new("Part")
+	hitbox.Name = "FlameAbilityHitbox"
+	hitbox.Size = HITBOX_SIZE
+	hitbox.Anchored = true
+	hitbox.CanCollide = false
+	hitbox.CanTouch = true
+	hitbox.Transparency = HITBOX_TRANSPARENCY -- Fully invisible (1 = invisible)
+	hitbox.Color = Color3.fromRGB(255, 80, 80) -- Color doesn't matter since it's invisible
+	hitbox.Material = Enum.Material.ForceField -- Material doesn't matter since it's invisible
+	hitbox.Shape = Enum.PartType.Block
+	hitbox.Parent = workspace
+
+	-- No visual effects needed since hitbox is invisible
+
+	-- Create SINGLE merged connection for position update, overlap check, and damage
+	-- This replaces 3 separate Heartbeat connections
+	local mergedConnection
+	mergedConnection = RunService.Heartbeat:Connect(function()
+		local shouldContinue = processHitbox(hitbox, abilityOwnerIdentifier, character, flameAttachment, humanoidRootPart)
+		if not shouldContinue then
+			if mergedConnection then
+				mergedConnection:Disconnect()
+			end
+		end
+	end)
+
+	return hitbox, mergedConnection
+end
+
+
+-- Function to get or set base walk speed (prevents stacking)
+getBaseWalkSpeed = function(humanoid)
+	if not humanoid:GetAttribute("BaseWalkSpeed") then
+		humanoid:SetAttribute("BaseWalkSpeed", humanoid.WalkSpeed)
+	end
+	return humanoid:GetAttribute("BaseWalkSpeed")
+end
+
+-- Function to apply smooth pushback to character (improved version - no jitter, no snapping)
+applyPushback = function(targetCharacter, abilityOwnerCharacter, abilityOwnerRootPart)
+	if not targetCharacter or not targetCharacter.Parent then return end
+	if not abilityOwnerRootPart or not abilityOwnerRootPart.Parent then return end
+
+	local targetRootPart = targetCharacter:FindFirstChild("HumanoidRootPart")
+	if not targetRootPart then return end
+
+	-- Calculate direction from ability owner to target (push away from ability owner)
+	local direction = (targetRootPart.Position - abilityOwnerRootPart.Position)
+	local distance = direction.Magnitude
+	if distance == 0 then return end -- Avoid division by zero
+
+	direction = direction / distance -- Normalize to get direction only
+
+	-- Check if pushback already exists - EXTEND instead of recreating (prevents micro-teleports)
+	local existingBodyVelocity = targetRootPart:FindFirstChild("FlamePushbackVelocity")
+
+	if existingBodyVelocity then
+		-- Pushback already exists - refresh direction and extend duration
+		-- This prevents the "restart from scratch" jitter
+		local existingData = existingBodyVelocity:GetAttribute("PushbackData")
+		if existingData then
+			-- Update direction to current direction (in case attacker moved)
+			existingBodyVelocity.Velocity = direction * PUSHBACK_FORCE
+			-- Reset fade timer to extend duration
+			existingBodyVelocity:SetAttribute("StartTime", tick())
+			return -- Don't create new one, just refresh existing
+		end
+	end
+
+	-- Create BodyVelocity for smooth, continuous pushback
+	local bodyVelocity = Instance.new("BodyVelocity")
+	bodyVelocity.Name = "FlamePushbackVelocity"
+	bodyVelocity.MaxForce = Vector3.new(4000, 0, 4000) -- Only horizontal pushback (no vertical)
+	bodyVelocity.Velocity = direction * PUSHBACK_FORCE
+	bodyVelocity.Parent = targetRootPart
+
+	-- Store metadata for fade management
+	bodyVelocity:SetAttribute("StartTime", tick())
+	bodyVelocity:SetAttribute("DirectionX", direction.X)
+	bodyVelocity:SetAttribute("DirectionY", direction.Y)
+	bodyVelocity:SetAttribute("DirectionZ", direction.Z)
+	bodyVelocity:SetAttribute("PushbackData", true)
+
+	-- Smooth fade-out system - single continuous fade, no loops fighting physics
+	spawn(function()
+		local startTime = tick()
+		local initialForce = PUSHBACK_FORCE
+		local constantTime = PUSHBACK_DURATION - PUSHBACK_FADE_TIME -- Time at constant force
+		local fadeStartTime = startTime + constantTime
+
+		-- Phase 1: Constant force (let physics integrate naturally)
+		wait(constantTime)
+
+		-- Phase 2: Smooth fade to zero (physics continues naturally)
+		if bodyVelocity and bodyVelocity.Parent then
+			local fadeSteps = math.max(1, math.floor(PUSHBACK_FADE_TIME / 0.05)) -- Update every 50ms
+			local stepSize = initialForce / fadeSteps
+
+			for i = 1, fadeSteps do
+				if not bodyVelocity or not bodyVelocity.Parent then break end
+				if not targetRootPart or not targetRootPart.Parent then break end
+
+				-- Get stored direction (in case it needs to be refreshed)
+				local storedDir = Vector3.new(
+					bodyVelocity:GetAttribute("DirectionX") or direction.X,
+					bodyVelocity:GetAttribute("DirectionY") or direction.Y,
+					bodyVelocity:GetAttribute("DirectionZ") or direction.Z
+				)
+
+				-- Smoothly reduce force (ease out curve)
+				local currentForce = initialForce - (stepSize * i)
+				bodyVelocity.Velocity = storedDir * math.max(0, currentForce)
+
+				wait(0.05) -- Update every 50ms for smooth fade
+			end
+
+			-- Ensure force reaches exactly zero before cleanup (prevents snap)
+			if bodyVelocity and bodyVelocity.Parent then
+				bodyVelocity.Velocity = Vector3.new(0, 0, 0)
+				wait(0.05) -- Small buffer to ensure zero is applied
+			end
+		end
+
+		-- Clean up ONLY after force has reached zero (no snapping)
+		if bodyVelocity and bodyVelocity.Parent then
+			bodyVelocity:Destroy()
+		end
+	end)
+end
+
+-- Function to create highlight effect on character
+createHighlight = function(character)
+	local highlight = Instance.new("Highlight")
+	highlight.Name = "FlameAbilityHighlight"
+	highlight.FillColor = Color3.fromRGB(255, 0, 0) -- Red
+	highlight.OutlineColor = Color3.fromRGB(200, 0, 0) -- Darker red outline
+	highlight.FillTransparency = HIGHLIGHT_FILL_TRANSPARENCY -- Less visible (configurable)
+	highlight.OutlineTransparency = 0
+	highlight.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
+	highlight.Enabled = true
+	highlight.Parent = character
+	return highlight
+end
+
+-- Function to flicker highlight dark red (smooth tweened version)
+flickerHighlight = function(highlight)
+	if not highlight or not highlight.Parent then return end
+
+	-- Store original colors if not already stored
+	if not highlight:GetAttribute("OriginalFillR") then
+		highlight:SetAttribute("OriginalFillR", highlight.FillColor.R)
+		highlight:SetAttribute("OriginalFillG", highlight.FillColor.G)
+		highlight:SetAttribute("OriginalFillB", highlight.FillColor.B)
+		highlight:SetAttribute("OriginalOutlineR", highlight.OutlineColor.R)
+		highlight:SetAttribute("OriginalOutlineG", highlight.OutlineColor.G)
+		highlight:SetAttribute("OriginalOutlineB", highlight.OutlineColor.B)
+	end
+
+	local originalFill = Color3.new(
+		highlight:GetAttribute("OriginalFillR"),
+		highlight:GetAttribute("OriginalFillG"),
+		highlight:GetAttribute("OriginalFillB")
+	)
+	local originalOutline = Color3.new(
+		highlight:GetAttribute("OriginalOutlineR"),
+		highlight:GetAttribute("OriginalOutlineG"),
+		highlight:GetAttribute("OriginalOutlineB")
+	)
+
+	-- Dark red colors for flicker
+	local darkFill = Color3.fromRGB(120, 0, 0) -- Dark red (slightly brighter for smoother look)
+	local darkOutline = Color3.fromRGB(60, 0, 0) -- Very dark red
+
+	-- Smooth tween to dark red (quick flicker in - configurable speed)
+	local flickerIn = TweenService:Create(
+		highlight,
+		TweenInfo.new(HIGHLIGHT_FLICKER_IN_TIME, Enum.EasingStyle.Quad, Enum.EasingDirection.Out),
+		{
+			FillColor = darkFill,
+			OutlineColor = darkOutline
+		}
+	)
+
+	-- Smooth tween back to original (quick flicker out - configurable speed)
+	local flickerOut = TweenService:Create(
+		highlight,
+		TweenInfo.new(HIGHLIGHT_FLICKER_OUT_TIME, Enum.EasingStyle.Quad, Enum.EasingDirection.In),
+		{
+			FillColor = originalFill,
+			OutlineColor = originalOutline
+		}
+	)
+
+	-- Play flicker animation
+	flickerIn:Play()
+	flickerIn.Completed:Connect(function()
+		if highlight and highlight.Parent then
+			flickerOut:Play()
+		end
+	end)
+end
+
+-- Function to remove effects from character (per ability owner) - works for both players and NPCs
+removeHitboxEffects = function(abilityOwnerIdentifier, targetCharacterIdentifier)
+	if not affectedCharacters[abilityOwnerIdentifier] or not affectedCharacters[abilityOwnerIdentifier][targetCharacterIdentifier] then
+		return
+	end
+
+	local data = affectedCharacters[abilityOwnerIdentifier][targetCharacterIdentifier]
+
+	-- Get the character (works for both players and NPCs)
+	local character = nil
+	if typeof(targetCharacterIdentifier) == "Instance" and targetCharacterIdentifier:IsA("Player") then
+		character = targetCharacterIdentifier.Character
+	elseif typeof(targetCharacterIdentifier) == "Instance" then
+		character = targetCharacterIdentifier
+	end
+
+	-- Restore walk speed to base (prevents stacking issues)
+	if character and character.Parent then
+		local humanoid = character:FindFirstChild("Humanoid")
+		if humanoid and data.humanoid == humanoid then
+			local baseSpeed = getBaseWalkSpeed(humanoid)
+			humanoid.WalkSpeed = baseSpeed
+		end
+	end
+
+	-- Remove highlight
+	if data.highlight and data.highlight.Parent then
+		data.highlight:Destroy()
+	end
+
+	-- Remove from tracking
+	affectedCharacters[abilityOwnerIdentifier][targetCharacterIdentifier] = nil
+
+	-- Clean up empty table
+	if next(affectedCharacters[abilityOwnerIdentifier]) == nil then
+		affectedCharacters[abilityOwnerIdentifier] = nil
+	end
+end
+
+-- Function to apply effects to character in hitbox (per ability owner) - works for both players and NPCs
+applyHitboxEffects = function(abilityOwnerIdentifier, targetCharacterIdentifier, character, humanoid, hitbox)
+	-- Initialize ability owner's table if needed
+	if not affectedCharacters[abilityOwnerIdentifier] then
+		affectedCharacters[abilityOwnerIdentifier] = {}
+	end
+
+	-- Check if already affected by this ability
+	if affectedCharacters[abilityOwnerIdentifier][targetCharacterIdentifier] then
+		return -- Already affected by this ability
+	end
+
+	-- Get base walk speed (prevents stacking)
+	local baseWalkSpeed = getBaseWalkSpeed(humanoid)
+
+	-- Apply slow effect (always use base speed)
+	humanoid.WalkSpeed = baseWalkSpeed * SLOW_MULTIPLIER
+
+	-- Create highlight
+	local highlight = createHighlight(character)
+
+	-- Store data (no separate damage connection - handled in merged loop)
+	affectedCharacters[abilityOwnerIdentifier][targetCharacterIdentifier] = {
+		highlight = highlight,
+		lastDamageTime = 0,
+		humanoid = humanoid
+	}
+end
+
+-- Core function to activate ability for any character (player or NPC)
+local function activateAbilityForCharacter(character)
+	if not character or not character.Parent then
+		return false
+	end
+
+	local humanoidRootPart = character:FindFirstChild("HumanoidRootPart")
+	if not humanoidRootPart then
+		return false
+	end
+
+	local humanoid = character:FindFirstChild("Humanoid")
+	if not humanoid or humanoid.Health <= 0 then
+		return false -- Character is dead or invalid
+	end
+
+	-- Get identifier (player or character)
+	local characterIdentifier = getCharacterIdentifier(character)
+
+	-- Check if can use ability
+	if not canUseAbility(characterIdentifier) then
+		return false
+	end
+
+	-- Set cooldown and active state
+	characterCooldowns[characterIdentifier] = tick() + COOLDOWN_TIME
+	characterActiveStates[characterIdentifier] = true
+
+	-- Server does NOT play animation or create VFX
+	-- Animation and VFX are CLIENT-AUTHORITATIVE
+	-- Server only signals clients to play VFX (replication)
+	replicateVFXToClients(character)
+
+	-- Calculate total ability duration dynamically
+	local totalDuration = VFX_DELAY_AFTER_ANIMATION + VFX_DURATION + 0.5 -- Small buffer
+
+	-- Create server-side hitbox immediately (client has already waited for VFX_DELAY_AFTER_ANIMATION)
+	-- The client fires this event after particles are activated, so hitbox should start now
+	spawn(function()
+		-- Verify character still exists
+		if not character or not character.Parent then
+			characterActiveStates[characterIdentifier] = false
+			return
+		end
+
+		if not humanoidRootPart or not humanoidRootPart.Parent then
+			characterActiveStates[characterIdentifier] = false
+			return
+		end
+
+		-- Create server-side hitbox immediately to match VFX timing
+		local hitbox, hitboxConnection = createServerHitbox(character, humanoidRootPart, characterIdentifier)
+		characterHitboxes[characterIdentifier] = hitbox
+		characterHitboxConnections[characterIdentifier] = hitboxConnection
+
+		-- Wait for VFX duration, then clean up hitbox
+		wait(VFX_DURATION)
+
+		-- Disconnect merged connection
+		if characterHitboxConnections[characterIdentifier] then
+			characterHitboxConnections[characterIdentifier]:Disconnect()
+			characterHitboxConnections[characterIdentifier] = nil
+		end
+
+		-- Remove all effects from characters affected by THIS ability only
+		if affectedCharacters[characterIdentifier] then
+			for targetIdentifier, _ in pairs(affectedCharacters[characterIdentifier]) do
+				removeHitboxEffects(characterIdentifier, targetIdentifier)
+			end
+		end
+
+		-- Clean up hitbox (no fade needed since it's invisible)
+		if characterHitboxes[characterIdentifier] and characterHitboxes[characterIdentifier].Parent then
+			characterHitboxes[characterIdentifier]:Destroy()
+			characterHitboxes[characterIdentifier] = nil
+		end
+	end)
+
+	-- Clear active state after calculated duration
+	task.delay(totalDuration, function()
+		characterActiveStates[characterIdentifier] = false
+	end)
+
+	return true
+end
+
+-- Handle ability activation from client (players)
+remoteEvent.OnServerEvent:Connect(function(player, action)
+	if action == "ActivateAbility" then
+		local character = player.Character
+		if character then
+			activateAbilityForCharacter(character)
+		end
+	end
+end)
+
+-- Create a BindableEvent for NPCs to trigger the ability
+-- Other scripts can fire this event to activate the ability for NPCs
+-- Usage: ReplicatedStorage.RE.FlameAbilityNPC:Fire(character)
+local npcBindable = Instance.new("BindableEvent")
+npcBindable.Name = "FlameAbilityNPC"
+npcBindable.Parent = ReplicatedStorage:WaitForChild("RE")
+
+npcBindable.Event:Connect(function(character)
+	if typeof(character) == "Instance" and character:IsA("Model") then
+		activateAbilityForCharacter(character)
+	end
+end)
+
+-- Clean up when player leaves
+Players.PlayerRemoving:Connect(function(player)
+	local characterIdentifier = player
+
+	-- Remove effects from characters affected by this player's ability
+	if affectedCharacters[characterIdentifier] then
+		for targetIdentifier, _ in pairs(affectedCharacters[characterIdentifier]) do
+			removeHitboxEffects(characterIdentifier, targetIdentifier)
+		end
+		affectedCharacters[characterIdentifier] = nil
+	end
+
+	-- Remove effects from this player if they were affected by other abilities
+	for abilityOwnerIdentifier, targets in pairs(affectedCharacters) do
+		if targets[characterIdentifier] then
+			removeHitboxEffects(abilityOwnerIdentifier, characterIdentifier)
+		end
+	end
+
+	-- Clean up hitbox and connection
+	if characterHitboxConnections[characterIdentifier] then
+		characterHitboxConnections[characterIdentifier]:Disconnect()
+		characterHitboxConnections[characterIdentifier] = nil
+	end
+	if characterHitboxes[characterIdentifier] and characterHitboxes[characterIdentifier].Parent then
+		characterHitboxes[characterIdentifier]:Destroy()
+		characterHitboxes[characterIdentifier] = nil
+	end
+
+	characterCooldowns[characterIdentifier] = nil
+	characterActiveStates[characterIdentifier] = nil
+end)
+
+-- Clean up when character is removed (respawn) - for existing players
+for _, player in ipairs(Players:GetPlayers()) do
+	player.CharacterRemoving:Connect(function(character)
+		local characterIdentifier = player
+
+		-- Remove effects from characters affected by this player's ability
+		if affectedCharacters[characterIdentifier] then
+			for targetIdentifier, _ in pairs(affectedCharacters[characterIdentifier]) do
+				removeHitboxEffects(characterIdentifier, targetIdentifier)
+			end
+			affectedCharacters[characterIdentifier] = nil
+		end
+
+		-- Remove effects from this player if they were affected by other abilities
+		for abilityOwnerIdentifier, targets in pairs(affectedCharacters) do
+			if targets[characterIdentifier] then
+				removeHitboxEffects(abilityOwnerIdentifier, characterIdentifier)
+			end
+		end
+
+		-- Clean up hitbox and connection
+		if characterHitboxConnections[characterIdentifier] then
+			characterHitboxConnections[characterIdentifier]:Disconnect()
+			characterHitboxConnections[characterIdentifier] = nil
+		end
+		if characterHitboxes[characterIdentifier] and characterHitboxes[characterIdentifier].Parent then
+			characterHitboxes[characterIdentifier]:Destroy()
+			characterHitboxes[characterIdentifier] = nil
+		end
+	end)
+end
+
+-- Clean up when character is removed (respawn) - for new players
+Players.PlayerAdded:Connect(function(player)
+	player.CharacterRemoving:Connect(function(character)
+		local characterIdentifier = player
+
+		-- Remove effects from characters affected by this player's ability
+		if affectedCharacters[characterIdentifier] then
+			for targetIdentifier, _ in pairs(affectedCharacters[characterIdentifier]) do
+				removeHitboxEffects(characterIdentifier, targetIdentifier)
+			end
+			affectedCharacters[characterIdentifier] = nil
+		end
+
+		-- Remove effects from this player if they were affected by other abilities
+		for abilityOwnerIdentifier, targets in pairs(affectedCharacters) do
+			if targets[characterIdentifier] then
+				removeHitboxEffects(abilityOwnerIdentifier, characterIdentifier)
+			end
+		end
+
+		-- Clean up hitbox and connection
+		if characterHitboxConnections[characterIdentifier] then
+			characterHitboxConnections[characterIdentifier]:Disconnect()
+			characterHitboxConnections[characterIdentifier] = nil
+		end
+		if characterHitboxes[characterIdentifier] and characterHitboxes[characterIdentifier].Parent then
+			characterHitboxes[characterIdentifier]:Destroy()
+			characterHitboxes[characterIdentifier] = nil
+		end
+	end)
+end)
+
+-- Clean up when NPC characters are removed
+-- This handles NPCs that are destroyed/removed from workspace
+workspace.ChildRemoved:Connect(function(child)
+	-- Check if it's a character (has Humanoid and HumanoidRootPart)
+	if child:FindFirstChild("Humanoid") and child:FindFirstChild("HumanoidRootPart") then
+		local player = Players:GetPlayerFromCharacter(child)
+		-- Only process if it's an NPC (not a player)
+		if not player then
+			local characterIdentifier = child
+
+			-- Remove effects from characters affected by this NPC's ability
+			if affectedCharacters[characterIdentifier] then
+				for targetIdentifier, _ in pairs(affectedCharacters[characterIdentifier]) do
+					removeHitboxEffects(characterIdentifier, targetIdentifier)
+				end
+				affectedCharacters[characterIdentifier] = nil
+			end
+
+			-- Remove effects from this NPC if it was affected by other abilities
+			for abilityOwnerIdentifier, targets in pairs(affectedCharacters) do
+				if targets[characterIdentifier] then
+					removeHitboxEffects(abilityOwnerIdentifier, characterIdentifier)
+				end
+			end
+
+			-- Clean up hitbox and connection
+			if characterHitboxConnections[characterIdentifier] then
+				characterHitboxConnections[characterIdentifier]:Disconnect()
+				characterHitboxConnections[characterIdentifier] = nil
+			end
+			if characterHitboxes[characterIdentifier] and characterHitboxes[characterIdentifier].Parent then
+				characterHitboxes[characterIdentifier]:Destroy()
+				characterHitboxes[characterIdentifier] = nil
+			end
+
+			characterCooldowns[characterIdentifier] = nil
+			characterActiveStates[characterIdentifier] = nil
+		end
+	end
+end)
