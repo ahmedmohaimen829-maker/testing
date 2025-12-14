@@ -1,0 +1,427 @@
+-- Flame Ability LocalScript
+-- Place this in StarterPlayer > StarterCharacterScripts
+
+local Players = game:GetService("Players")
+local UserInputService = game:GetService("UserInputService")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local TweenService = game:GetService("TweenService")
+local RunService = game:GetService("RunService")
+
+local player = Players.LocalPlayer
+local character = player.Character or player.CharacterAdded:Wait()
+local humanoid = character:WaitForChild("Humanoid")
+local humanoidRootPart = character:WaitForChild("HumanoidRootPart")
+
+-- Get RemoteEvent
+local remoteEvent = ReplicatedStorage:WaitForChild("RE"):WaitForChild("FlameAbilityEvent")
+
+-- Configuration
+local COOLDOWN_TIME = 2 -- seconds
+local ANIMATION_ID = "80791375022267" -- Put your animation ID here (just the number, e.g., "123456789")
+local VFX_PATH = ReplicatedStorage:WaitForChild("VFX"):WaitForChild("FlameVFX")
+local VFX_OFFSET = Vector3.new(0, 0, -3.5) -- Position in front of character (negative Z = forward)
+local VFX_DURATION = 1 -- Duration of VFX effect
+local VFX_DELAY_AFTER_ANIMATION = 0.45 -- Delay in seconds before VFX starts after animation begins
+
+-- State variables
+local isOnCooldown = false
+local isActive = false
+local alignPositionInstance = nil
+local alignAttachment = nil
+local lockAttachment = nil -- Lock attachment in workspace for TwoAttachment mode
+local originalWalkSpeed = humanoid.WalkSpeed
+local originalJumpPower = humanoid.JumpPower
+
+-- Get all particle emitters recursively (optimized)
+local function getAllParticleEmitters(instance)
+	local emitters = {}
+
+	local function searchRecursive(obj)
+		if obj:IsA("ParticleEmitter") then
+			table.insert(emitters, obj)
+		end
+
+		for _, child in ipairs(obj:GetChildren()) do
+			searchRecursive(child)
+		end
+	end
+
+	searchRecursive(instance)
+	return emitters
+end
+
+-- Enable/Disable movement (but allow camera rotation)
+local function setMovementEnabled(enabled)
+	if enabled then
+		-- Clean up position lock (modern AlignPosition with TwoAttachment mode)
+		if alignPositionInstance then
+			alignPositionInstance:Destroy()
+			alignPositionInstance = nil
+		end
+
+		if alignAttachment then
+			alignAttachment:Destroy()
+			alignAttachment = nil
+		end
+
+		if lockAttachment then
+			lockAttachment:Destroy()
+			lockAttachment = nil
+		end
+
+		-- Also check for any leftover MovementLock
+		local leftoverLock = humanoidRootPart:FindFirstChild("MovementLock")
+		if leftoverLock then
+			leftoverLock:Destroy()
+		end
+
+		-- Re-enable movement (NO PlatformStand - that's what was breaking it!)
+		humanoid.WalkSpeed = originalWalkSpeed
+		humanoid.JumpPower = originalJumpPower
+	else
+		-- Store original values
+		originalWalkSpeed = humanoid.WalkSpeed
+		originalJumpPower = humanoid.JumpPower
+
+		-- Lock movement but allow camera rotation (NO PlatformStand!)
+		humanoid.WalkSpeed = 0
+		humanoid.JumpPower = 0
+
+		-- Store initial position for lock attachment
+		local lockPosition = humanoidRootPart.Position
+
+		-- Use modern AlignPosition with TwoAttachment mode (physics-safe, no jitter)
+		-- Create lock attachment in workspace at the position we want to lock to
+		lockAttachment = Instance.new("Attachment")
+		lockAttachment.WorldPosition = lockPosition
+		lockAttachment.Parent = workspace.Terrain or workspace
+
+		-- Create attachment on HumanoidRootPart
+		alignAttachment = Instance.new("Attachment")
+		alignAttachment.Name = "MovementLockAttachment"
+		alignAttachment.Parent = humanoidRootPart
+
+		-- Create AlignPosition with TwoAttachment mode (no manual position writes needed!)
+		alignPositionInstance = Instance.new("AlignPosition")
+		alignPositionInstance.Name = "MovementLock"
+		alignPositionInstance.Mode = Enum.PositionAlignmentMode.TwoAttachment
+		alignPositionInstance.Attachment0 = alignAttachment
+		alignPositionInstance.Attachment1 = lockAttachment
+		alignPositionInstance.RigidityEnabled = true
+		alignPositionInstance.MaxForce = math.huge
+		alignPositionInstance.Responsiveness = 200
+		alignPositionInstance.Parent = humanoidRootPart
+
+		-- NO Heartbeat loop needed! AlignPosition handles everything physics-safe
+	end
+end
+
+-- Activate all particle emitters with CONTINUOUS emission (Enabled = true)
+-- This allows particles to emit naturally over time based on their Rate
+-- Each client enables once, particles emit continuously until disabled
+local function activateParticleEmitters(parent)
+	local emitters = getAllParticleEmitters(parent)
+
+	for _, emitter in ipairs(emitters) do
+		-- Enable continuous emission (particles emit based on Rate over time)
+		emitter.Enabled = true
+		-- Do NOT call Emit() - let Enabled handle continuous emission
+	end
+end
+
+-- Client-side hitbox removed - server handles all hitbox logic
+
+-- Function to create and show VFX for a character (used for replication)
+local function showVFXForCharacter(targetCharacter)
+	if not targetCharacter then return end
+
+	local targetHumanoidRootPart = targetCharacter:FindFirstChild("HumanoidRootPart")
+	if not targetHumanoidRootPart then return end
+
+	-- Clone VFX
+	local vfxClone = VFX_PATH:Clone()
+
+	-- Find and attach Flame attachment
+	local flame = vfxClone:FindFirstChild("Flame")
+	if not flame or not flame:IsA("Attachment") then
+		vfxClone:Destroy()
+		return
+	end
+
+	-- Parent the attachment to target's HumanoidRootPart
+	flame.Parent = targetHumanoidRootPart
+	flame.Position = VFX_OFFSET
+
+	-- Smooth fade in
+	local originalTransparency = {}
+	for _, part in ipairs(flame:GetDescendants()) do
+		if part:IsA("BasePart") then
+			originalTransparency[part] = part.Transparency
+			part.Transparency = 1
+		end
+	end
+
+	for part, origTrans in pairs(originalTransparency) do
+		local tween = TweenService:Create(
+			part,
+			TweenInfo.new(0.3, Enum.EasingStyle.Quad, Enum.EasingDirection.Out),
+			{Transparency = origTrans}
+		)
+		tween:Play()
+	end
+
+	vfxClone:Destroy()
+
+	wait(0.1)
+
+	-- Activate particle emitters (continuous emission)
+	activateParticleEmitters(flame)
+
+	-- Wait for VFX duration, then disable emitters
+	wait(VFX_DURATION)
+
+	-- Disable all particle emitters after VFX_DURATION (stops continuous emission)
+	if flame and flame.Parent == targetHumanoidRootPart then
+		for _, emitter in ipairs(getAllParticleEmitters(flame)) do
+			emitter.Enabled = false
+		end
+	end
+
+	-- Smooth fade out and cleanup (improved easing)
+	spawn(function()
+		if flame and flame.Parent == targetHumanoidRootPart then
+			for _, part in ipairs(flame:GetDescendants()) do
+				if part:IsA("BasePart") then
+					local tween = TweenService:Create(
+						part,
+						TweenInfo.new(1.2, Enum.EasingStyle.Quart, Enum.EasingDirection.In), -- Smoother fade out
+						{Transparency = 1}
+					)
+					tween:Play()
+				end
+			end
+
+			wait(1.3) -- Slightly longer wait for smoother fade
+
+			if flame and flame.Parent == targetHumanoidRootPart then
+				flame:Destroy()
+			end
+		end
+	end)
+end
+
+-- Listen for VFX replication from server (for other players)
+remoteEvent.OnClientEvent:Connect(function(action, targetCharacter)
+	if action == "ShowVFX" and targetCharacter then
+		showVFXForCharacter(targetCharacter)
+	end
+end)
+
+-- Main ability function
+local function activateFlameAbility()
+	if isOnCooldown or isActive then
+		return
+	end
+
+	isActive = true
+
+	-- Lock movement
+	setMovementEnabled(false)
+
+	-- Play animation first if ID is provided
+	local animationTrack = nil
+	local animationDuration = VFX_DURATION
+
+	if ANIMATION_ID ~= "" then
+		local animation = Instance.new("Animation")
+		animation.AnimationId = "rbxassetid://" .. ANIMATION_ID
+		animationTrack = humanoid:LoadAnimation(animation)
+		animationTrack:Play()
+
+		-- Get animation length
+		if animationTrack.Length > 0 then
+			animationDuration = animationTrack.Length
+		end
+
+		-- Wait for VFX delay after animation starts
+		wait(VFX_DELAY_AFTER_ANIMATION)
+	else
+		-- If no animation, wait for VFX delay
+		wait(VFX_DELAY_AFTER_ANIMATION)
+	end
+
+	-- Now set up and activate VFX
+	local vfxClone = VFX_PATH:Clone()
+
+	-- Find and attach Flame attachment to HumanoidRootPart
+	local flame = vfxClone:FindFirstChild("Flame")
+	if not flame or not flame:IsA("Attachment") then
+		warn("Flame attachment not found in VFX!")
+		vfxClone:Destroy()
+		if animationTrack then
+			animationTrack:Stop()
+			animationTrack:Destroy()
+		end
+		setMovementEnabled(true)
+		isActive = false
+		return
+	end
+
+	-- Parent the attachment to HumanoidRootPart
+	flame.Parent = humanoidRootPart
+
+	-- Position attachment slightly in front of HumanoidRootPart at same height
+	-- Attachment Position is relative to the part it's attached to
+	-- Negative Z = forward direction, 0 Y = same height
+	flame.Position = VFX_OFFSET
+
+	-- Smooth fade in for any parts in the attachment's descendants
+	local originalTransparency = {}
+	for _, part in ipairs(flame:GetDescendants()) do
+		if part:IsA("BasePart") then
+			originalTransparency[part] = part.Transparency
+			part.Transparency = 1
+		end
+	end
+
+	-- Smooth tween in (improved easing for smoother appearance)
+	for part, origTrans in pairs(originalTransparency) do
+		local tween = TweenService:Create(
+			part,
+			TweenInfo.new(0.4, Enum.EasingStyle.Quart, Enum.EasingDirection.Out), -- Slightly longer and smoother
+			{Transparency = origTrans}
+		)
+		tween:Play()
+	end
+
+	-- Activate particle emitters FIRST (before destroying container)
+	activateParticleEmitters(flame)
+
+	-- Small delay for smoother effect
+	wait(0.1)
+
+	-- Clean up the empty VFX clone (Flame has been moved out)
+	vfxClone:Destroy()
+
+	-- Notify server that ability is being activated (server handles hitbox)
+	remoteEvent:FireServer("ActivateAbility")
+
+	-- Wait for VFX duration, then disable emitters
+	wait(VFX_DURATION)
+
+	-- Disable all particle emitters after VFX_DURATION (stops continuous emission)
+	if flame and flame.Parent == humanoidRootPart then
+		for _, emitter in ipairs(getAllParticleEmitters(flame)) do
+			emitter.Enabled = false
+		end
+	end
+
+	-- Wait for animation to finish (if it hasn't already) with timeout fallback
+	if animationTrack then
+		-- Set up timeout fallback in case animation fails to load or network issues
+		local animationTimeout = spawn(function()
+			wait(animationTrack.Length + 0.2) -- Animation length + small buffer
+			if isActive then
+				-- Animation didn't end properly, force unlock
+				setMovementEnabled(true)
+				if animationTrack then
+					animationTrack:Stop()
+					animationTrack:Destroy()
+				end
+			end
+		end)
+
+		-- Wait for animation to finish
+		animationTrack.Ended:Wait()
+
+		-- Cancel timeout if animation ended normally
+		if animationTimeout then
+			-- Timeout will naturally expire, but animation already ended
+		end
+
+		-- Clean up animation properly
+		animationTrack:Stop()
+		animationTrack:Destroy()
+	end
+
+	-- Re-enable movement immediately after ability/VFX are done
+	setMovementEnabled(true)
+
+	-- Start cooldown immediately (before setting isActive = false to prevent race condition)
+	isOnCooldown = true
+
+	-- Cooldown timer
+	spawn(function()
+		wait(COOLDOWN_TIME)
+		isOnCooldown = false
+	end)
+
+	-- Set isActive = false AFTER cooldown starts (prevents race condition)
+	isActive = false
+
+	-- Do fade out and cleanup in parallel (doesn't block movement)
+	spawn(function()
+		-- Smooth fade out effect for all parts in Flame attachment
+		if flame and flame.Parent == humanoidRootPart then
+			for _, part in ipairs(flame:GetDescendants()) do
+				if part:IsA("BasePart") then
+					local tween = TweenService:Create(
+						part,
+						TweenInfo.new(1, Enum.EasingStyle.Quad, Enum.EasingDirection.In),
+						{Transparency = 1}
+					)
+					tween:Play()
+				end
+			end
+
+			wait(1.2) -- Wait for fade out
+
+			-- Cleanup Flame attachment
+			if flame and flame.Parent == humanoidRootPart then
+				flame:Destroy()
+			end
+		end
+	end)
+end
+
+-- Input handling
+UserInputService.InputBegan:Connect(function(input, gameProcessed)
+	if gameProcessed then return end
+
+	if input.KeyCode == Enum.KeyCode.F then
+		-- Better guard: check both conditions (prevents race condition)
+		if isActive or isOnCooldown then
+			return
+		end
+		activateFlameAbility()
+	end
+end)
+
+-- Handle character respawn
+player.CharacterAdded:Connect(function(newCharacter)
+	character = newCharacter
+	humanoid = newCharacter:WaitForChild("Humanoid")
+	humanoidRootPart = newCharacter:WaitForChild("HumanoidRootPart")
+	originalWalkSpeed = humanoid.WalkSpeed
+	originalJumpPower = humanoid.JumpPower
+	isActive = false
+	isOnCooldown = false
+
+	-- Note: SetNetworkOwner can only be called from server, not client
+	-- Network ownership is handled server-side if needed
+
+	-- Clean up any existing connections and locks
+	if alignPositionInstance then
+		alignPositionInstance:Destroy()
+		alignPositionInstance = nil
+	end
+	if alignAttachment then
+		alignAttachment:Destroy()
+		alignAttachment = nil
+	end
+	if lockAttachment then
+		lockAttachment:Destroy()
+		lockAttachment = nil
+	end
+end)
+
