@@ -70,11 +70,20 @@ Config.Audio = {
 -- HITBOX SETTINGS
 -- ============================================
 Config.Hitbox = {
+	-- Normal hit hitbox
 	Size = Vector3.new(6, 6, 6),
 	ForwardOffset = 3.2,
 	Duration = 0.5,
 	DebugVisualization = false, -- Set to true to see hitboxes
 	DebugTransparency = 0.5,
+
+	-- Final hit hitbox (YELLOW - Expanding)
+	Final = {
+		StartSize = Vector3.new(6, 6, 6),   -- Starting size
+		EndSize = Vector3.new(6, 6, 11),    -- Ending size (expands forward)
+		Duration = 0.8,                      -- Longer duration for Final hit
+		DebugColor = Color3.fromRGB(255, 255, 0), -- Yellow for Final
+	},
 }
 
 -- ============================================

@@ -686,68 +686,111 @@ end
 -- OPTIMIZED HITBOX SYSTEM
 -- ============================================
 local function createHitbox(abilityOwner, character, humanoidRootPart, vfxType, customDuration)
-	if not character or not character.Parent then return end
-	if not humanoidRootPart or not humanoidRootPart.Parent then return end
+	-- CRITICAL: Add logging at function entry
+	print(string.format("[HITBOX] createHitbox called - Owner: %s, VFX: %s", abilityOwner.Name, vfxType))
+
+	if not character or not character.Parent then
+		warn("[HITBOX] Character invalid or parent nil")
+		return
+	end
+	if not humanoidRootPart or not humanoidRootPart.Parent then
+		warn("[HITBOX] HumanoidRootPart invalid or parent nil")
+		return
+	end
 
 	local abilityData = activeAbilities[abilityOwner]
-	if not abilityData then return end
+	if not abilityData then
+		warn("[HITBOX] No active ability data for owner:", abilityOwner.Name)
+		return
+	end
 
-	pcall(function()
-		-- Determine if this is Final hit for special handling
-		local isFinalHit = (vfxType == Config.Network.Actions.Final)
+	-- REMOVED pcall - we NEED to see errors!
+	-- Determine if this is Final hit for special handling
+	local isFinalHit = (vfxType == Config.Network.Actions.Final)
 
-		-- Create hitbox part with dynamic size for Final hit
-		local hitbox = Instance.new("Part")
-		hitbox.Name = "SlashAbilityHitbox"
-		hitbox.Size = Config.Hitbox.Size -- Start at 6,6,6
-		hitbox.Anchored = true
-		hitbox.CanCollide = false
-		hitbox.CanTouch = false
-		hitbox.CanQuery = false
-		hitbox.Massless = true
-		hitbox.Parent = workspace
+	if isFinalHit then
+		print("╔════════════════════════════════════════╗")
+		print("║   FINAL HIT HITBOX CREATION START     ║")
+		print("╚════════════════════════════════════════╝")
+	end
 
-		-- Debug visualization
-		if Config.Hitbox.DebugVisualization then
-			hitbox.Transparency = Config.Hitbox.DebugTransparency
-			hitbox.Color = isFinalHit and Color3.fromRGB(255, 255, 0) or Color3.fromRGB(255, 0, 0)
-			hitbox.Material = Enum.Material.ForceField
-		else
-			hitbox.Transparency = 1
+	-- Get hitbox configuration based on type
+	local hitboxSize = isFinalHit and Config.Hitbox.Final.StartSize or Config.Hitbox.Size
+	local hitboxDuration = customDuration or (isFinalHit and Config.Hitbox.Final.Duration or Config.Hitbox.Duration)
+	local hitboxColor = isFinalHit and Config.Hitbox.Final.DebugColor or Color3.fromRGB(255, 0, 0)
+
+	print(string.format("[HITBOX] Creating %s hitbox - Size: %s, Duration: %.2f",
+		isFinalHit and "FINAL (YELLOW)" or "NORMAL (RED)",
+		tostring(hitboxSize),
+		hitboxDuration))
+
+	-- Create hitbox part with dynamic size for Final hit
+	local hitbox = Instance.new("Part")
+	hitbox.Name = isFinalHit and "FinalHitbox_YELLOW" or "NormalHitbox_RED"
+	hitbox.Size = hitboxSize
+	hitbox.Anchored = true
+	hitbox.CanCollide = false
+	hitbox.CanTouch = false
+	hitbox.CanQuery = false
+	hitbox.Massless = true
+	hitbox.Parent = workspace
+
+	print("[HITBOX] Hitbox part created and parented to workspace")
+
+	-- Debug visualization
+	if Config.Hitbox.DebugVisualization then
+		hitbox.Transparency = Config.Hitbox.DebugTransparency
+		hitbox.Color = hitboxColor
+		hitbox.Material = Enum.Material.ForceField
+		print(string.format("[HITBOX] DEBUG MODE: Visible %s hitbox created", isFinalHit and "YELLOW" or "RED"))
+	else
+		hitbox.Transparency = 1
+		print("[HITBOX] Invisible hitbox created (debug mode off)")
+	end
+
+	-- Track hits for this specific hitbox
+	local hitboxHitPlayers = {}
+	local hitboxStartTime = tick()
+
+	if isFinalHit then
+		print(string.format("[HITBOX] Final hitbox will expand from %s to %s over %.2f seconds",
+			tostring(Config.Hitbox.Final.StartSize),
+			tostring(Config.Hitbox.Final.EndSize),
+			hitboxDuration))
+	end
+
+	-- Heartbeat connection for hitbox processing
+	local connection
+	connection = RunService.Heartbeat:Connect(function()
+		if not character or not character.Parent then
+			connection:Disconnect()
+			hitbox:Destroy()
+			return
 		end
 
-		-- Track hits for this specific hitbox
-		local hitboxHitPlayers = {}
-		local hitboxStartTime = tick()
+		if not humanoidRootPart or not humanoidRootPart.Parent then
+			connection:Disconnect()
+			hitbox:Destroy()
+			return
+		end
 
-		-- Heartbeat connection for hitbox processing
-		local connection
-		connection = RunService.Heartbeat:Connect(function()
-			if not character or not character.Parent then
-				connection:Disconnect()
-				hitbox:Destroy()
-				return
-			end
+		-- FINAL HIT: Expand hitbox size over time
+		if isFinalHit then
+			local elapsed = tick() - hitboxStartTime
+			local progress = math.min(elapsed / hitboxDuration, 1)
 
-			if not humanoidRootPart or not humanoidRootPart.Parent then
-				connection:Disconnect()
-				hitbox:Destroy()
-				return
-			end
+			-- Expand based on config
+			local startSize = Config.Hitbox.Final.StartSize
+			local endSize = Config.Hitbox.Final.EndSize
 
-			-- FINAL HIT: Expand hitbox size over time (6,6,6 → 6,6,11)
-			if isFinalHit then
-				local elapsed = tick() - hitboxStartTime
-				local duration = customDuration or Config.Hitbox.Duration
-				local progress = math.min(elapsed / duration, 1)
+			local currentSize = Vector3.new(
+				startSize.X + (endSize.X - startSize.X) * progress,
+				startSize.Y + (endSize.Y - startSize.Y) * progress,
+				startSize.Z + (endSize.Z - startSize.Z) * progress
+			)
 
-				-- Expand Z dimension from 6 to 11
-				local startZ = 6
-				local endZ = 11
-				local currentZ = startZ + (endZ - startZ) * progress
-
-				hitbox.Size = Vector3.new(6, 6, currentZ)
-			end
+			hitbox.Size = currentSize
+		end
 
 			-- Update hitbox position
 			local lookVector = humanoidRootPart.CFrame.LookVector
@@ -842,14 +885,30 @@ local function createHitbox(abilityOwner, character, humanoidRootPart, vfxType, 
 			end
 		end)
 
-		-- Clean up hitbox after duration (longer for Final hit)
-		task.delay(customDuration or Config.Hitbox.Duration, function()
-			connection:Disconnect()
-			if hitbox and hitbox.Parent then
-				hitbox:Destroy()
-			end
-		end)
+	-- Clean up hitbox after duration
+	task.delay(hitboxDuration, function()
+		print(string.format("[HITBOX] %s hitbox cleanup started after %.2f seconds",
+			isFinalHit and "FINAL (YELLOW)" or "NORMAL (RED)",
+			hitboxDuration))
+
+		connection:Disconnect()
+		if hitbox and hitbox.Parent then
+			hitbox:Destroy()
+			print("[HITBOX] Hitbox destroyed successfully")
+		else
+			warn("[HITBOX] Hitbox already destroyed or parent nil")
+		end
+
+		if isFinalHit then
+			print("╔════════════════════════════════════════╗")
+			print("║   FINAL HIT HITBOX CLEANUP COMPLETE    ║")
+			print("╚════════════════════════════════════════╝")
+		end
 	end)
+
+	print(string.format("[HITBOX] %s hitbox setup complete, will run for %.2f seconds",
+		isFinalHit and "FINAL (YELLOW)" or "NORMAL (RED)",
+		hitboxDuration))
 end
 
 -- ============================================
@@ -905,9 +964,21 @@ slashAbilityEvent.OnServerEvent:Connect(function(player, action, character)
 	end
 
 	-- Handle hit events
+	print(string.format("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"))
+	print(string.format("[SERVER EVENT] Received: %s from %s", action, player.Name))
+
+	if action == Config.Network.Actions.Final then
+		print("╔════════════════════════════════════════╗")
+		print("║     FINAL HIT EVENT RECEIVED!          ║")
+		print("╚════════════════════════════════════════╝")
+	end
+
 	if not validateHitEvent(player, action) then
+		warn(string.format("[SERVER EVENT] Validation FAILED for %s from %s", action, player.Name))
 		return
 	end
+
+	print(string.format("[SERVER EVENT] Validation PASSED for %s", action))
 
 	local abilityData = activeAbilities[player]
 
@@ -915,20 +986,39 @@ slashAbilityEvent.OnServerEvent:Connect(function(player, action, character)
 	abilityData.lastHitTime = tick()
 	abilityData.hitCount = abilityData.hitCount + 1
 
+	print(string.format("[SERVER EVENT] Hit count: %d/%d", abilityData.hitCount, Config.Validation.MaxHitsPerAbility))
+
 	-- Create hitbox (with extended duration for Final hit)
 	local humanoidRootPart = character:FindFirstChild("HumanoidRootPart")
 	if humanoidRootPart then
-		-- FIX #4: Extend duration for Final hit to ensure it connects
-		local duration = (action == Config.Network.Actions.Final) and 0.8 or nil
+		print("[SERVER EVENT] HumanoidRootPart found, creating hitbox...")
+
+		-- Use config duration for Final hit
+		local duration = (action == Config.Network.Actions.Final) and Config.Hitbox.Final.Duration or nil
+
+		if action == Config.Network.Actions.Final then
+			print(string.format("[SERVER EVENT] Final hit - Using duration: %.2f seconds", duration))
+		end
+
+		-- CALL createHitbox
 		createHitbox(player, character, humanoidRootPart, action, duration)
+
+		print("[SERVER EVENT] createHitbox call completed")
+	else
+		warn(string.format("[SERVER EVENT] ERROR: No HumanoidRootPart for %s!", player.Name))
 	end
 
 	-- Replicate to all other clients
+	local clientCount = 0
 	for _, otherPlayer in ipairs(Players:GetPlayers()) do
 		if otherPlayer ~= player then
 			slashAbilityEvent:FireClient(otherPlayer, action, character)
+			clientCount = clientCount + 1
 		end
 	end
+
+	print(string.format("[SERVER EVENT] Replicated %s to %d other clients", action, clientCount))
+	print(string.format("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"))
 end)
 
 -- ============================================
