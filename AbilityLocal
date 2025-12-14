@@ -1,9 +1,7 @@
--- Hold Animation LocalScript
+-- Optimized Hold Animation LocalScript
 -- Place this in StarterPlayer > StarterCharacterScripts
--- 
--- This script plays an animation when R is pressed
--- During the animation, movement is completely locked
--- VFX plays when animation events fire
+--
+-- OPTIMIZED: Preloaded animation, VFX, and audio for instant responsiveness
 
 local Players = game:GetService("Players")
 local UserInputService = game:GetService("UserInputService")
@@ -46,7 +44,7 @@ local FINAL_AUDIO_ID = "3359047385"
 -- VFX Position Configuration
 local STAB_POSITION = Vector3.new(1, 0, -3)
 local SLASH1_POSITION = Vector3.new(0, 0, -0.1)
-local SLASH3_POSITION = Vector3.new(0, 0, -0)
+local SLASH3_POSITION = Vector3.new(0, 0, 0)
 local SLASH4_POSITION = Vector3.new(0, 0, -3.5)
 local FINAL_POSITION = Vector3.new(0, -3.5, -7)
 
@@ -59,28 +57,78 @@ local FINAL_ROTATION = Vector3.new(0, 0, 0)
 local VFX_CLEANUP_TIME = 3
 
 -- State variables
-local animationTrack = nil
 local isPlaying = false
 local originalWalkSpeed = humanoid.WalkSpeed
 local originalJumpPower = humanoid.JumpPower
 local alignPositionInstance = nil
 local alignAttachment = nil
 local lockAttachment = nil
-local activeVFXParts = {}
 
--- Preloaded audio sounds (kept in memory, ready to play instantly)
+-- OPTIMIZATION: Preloaded assets kept in memory
+local preloadedAnimation = nil
+local preloadedAnimationTrack = nil
 local preloadedSounds = {}
+local markerConnections = {}
 
--- Function to preload all audio
-local function preloadAudio()
-	-- Clear any existing preloaded sounds
-	for _, sound in pairs(preloadedSounds) do
-		if sound and sound.Parent then
-			sound:Destroy()
+-- OPTIMIZATION: VFX container pool for reuse
+local vfxContainerPool = {}
+local POOL_SIZE = 10
+
+-- Function to get or create a VFX container from pool
+local function getVFXContainer()
+	for i, container in ipairs(vfxContainerPool) do
+		if container and container.Parent == nil then
+			container.Parent = workspace
+			return container
 		end
 	end
-	preloadedSounds = {}
 
+	-- Create new container if pool is empty
+	local container = Instance.new("Part")
+	container.Name = "VFXContainer"
+	container.Size = Vector3.new(1, 1, 1)
+	container.Transparency = 1
+	container.CanCollide = false
+	container.Anchored = true
+	container.Parent = workspace
+
+	if #vfxContainerPool < POOL_SIZE then
+		table.insert(vfxContainerPool, container)
+	end
+
+	return container
+end
+
+-- Function to return container to pool
+local function returnVFXContainer(container)
+	if container then
+		-- Clear children
+		for _, child in ipairs(container:GetChildren()) do
+			child:Destroy()
+		end
+		container.Parent = nil
+	end
+end
+
+-- Function to preload all assets (animation, VFX, audio)
+local function preloadAllAssets()
+	local assetsToPreload = {}
+
+	-- Preload animation
+	if ANIMATION_ID and ANIMATION_ID ~= "" then
+		preloadedAnimation = Instance.new("Animation")
+		preloadedAnimation.AnimationId = "rbxassetid://" .. ANIMATION_ID
+		table.insert(assetsToPreload, preloadedAnimation)
+	end
+
+	-- Preload VFX templates
+	table.insert(assetsToPreload, STAB_VFX)
+	table.insert(assetsToPreload, SLASH1_VFX)
+	table.insert(assetsToPreload, SLASH3_VFX)
+	table.insert(assetsToPreload, SLASH4_VFX)
+	table.insert(assetsToPreload, FINAL_VFX)
+
+	-- Preload audio
 	local audioIds = {
 		Stab = STAB_AUDIO_ID,
 		Slash1 = SLASH1_AUDIO_ID,
@@ -89,43 +137,83 @@ local function preloadAudio()
 		Final = FINAL_AUDIO_ID
 	}
 
-	-- Create and preload each sound
+	-- Clear existing sounds
+	for _, sound in pairs(preloadedSounds) do
+		if sound and sound.Parent then
+			sound:Destroy()
+		end
+	end
+	preloadedSounds = {}
+
+	-- Create and store sounds
 	for name, audioId in pairs(audioIds) do
 		if audioId and audioId ~= "" then
 			local sound = Instance.new("Sound")
 			sound.SoundId = "rbxassetid://" .. audioId
 			sound.Volume = 0.5
 			sound.Parent = humanoidRootPart
-
-			-- Store reference
 			preloadedSounds[name] = sound
+			table.insert(assetsToPreload, sound)
 		end
 	end
 
-	-- Preload all sounds using ContentProvider
-	local soundsToPreload = {}
-	for _, sound in pairs(preloadedSounds) do
-		table.insert(soundsToPreload, sound.SoundId)
+	-- Batch preload all assets
+	if #assetsToPreload > 0 then
+		ContentProvider:PreloadAsync(assetsToPreload)
 	end
 
-	if #soundsToPreload > 0 then
-		-- This ensures sounds are loaded into memory
-		ContentProvider:PreloadAsync(soundsToPreload)
-	end
-end
-
--- Preload audio on script start
-preloadAudio()
-
--- Function to clean up all active VFX parts
-local function cleanupAllVFX()
-	for _, part in ipairs(activeVFXParts) do
-		if part and part.Parent then
-			part:Destroy()
+	-- OPTIMIZATION: Pre-load animation track (most important for first-press responsiveness)
+	if preloadedAnimation and humanoid then
+		-- Disconnect old connections
+		for _, conn in ipairs(markerConnections) do
+			conn:Disconnect()
 		end
+		markerConnections = {}
+
+		preloadedAnimationTrack = humanoid:LoadAnimation(preloadedAnimation)
+
+		-- Pre-connect marker signals (they persist across plays)
+		table.insert(markerConnections, preloadedAnimationTrack:GetMarkerReachedSignal("Slash1"):Connect(function()
+			playVFX("Stab")
+			slashAbilityEvent:FireServer("Stab", character)
+		end))
+
+		table.insert(markerConnections, preloadedAnimationTrack:GetMarkerReachedSignal("Slash2"):Connect(function()
+			playVFX("Slash1")
+			slashAbilityEvent:FireServer("Slash1", character)
+		end))
+
+		table.insert(markerConnections, preloadedAnimationTrack:GetMarkerReachedSignal("Slash3"):Connect(function()
+			playVFX("Slash3")
+			slashAbilityEvent:FireServer("Slash3", character)
+		end))
+
+		table.insert(markerConnections, preloadedAnimationTrack:GetMarkerReachedSignal("Slash4"):Connect(function()
+			playVFX("Slash4")
+			slashAbilityEvent:FireServer("Slash4", character)
+		end))
+
+		table.insert(markerConnections, preloadedAnimationTrack:GetMarkerReachedSignal("Final"):Connect(function()
+			playVFX("Final")
+			slashAbilityEvent:FireServer("Final", character)
+		end))
 	end
-	activeVFXParts = {}
+
+	-- Pre-create VFX container pool
+	for i = 1, POOL_SIZE do
+		local container = Instance.new("Part")
+		container.Name = "VFXContainer"
+		container.Size = Vector3.new(1, 1, 1)
+		container.Transparency = 1
+		container.CanCollide = false
+		container.Anchored = true
+		container.Parent = nil -- Start in pool (not in workspace)
+		table.insert(vfxContainerPool, container)
+	end
 end
+
+-- Preload on script start
+preloadAllAssets()
 
 -- Function to lock movement completely
 local function setMovementLocked(locked)
@@ -176,22 +264,19 @@ local function setMovementLocked(locked)
 	end
 end
 
--- Function to play VFX at a position relative to HumanoidRootPart
+-- OPTIMIZATION: Streamlined VFX playback
 local function playVFXAtPosition(vfxTemplate, relativePosition, rotation, targetRootPart)
 	targetRootPart = targetRootPart or humanoidRootPart
-	if not vfxTemplate then 
-		warn("VFX template not found!")
-		return 
-	end
+	if not vfxTemplate then return end
 
-	local vfxClone = vfxTemplate:Clone()
+	local container = getVFXContainer()
 
-	local rotationCFrame = CFrame.new(0, 0, 0)
+	local rotationCFrame = CFrame.new()
 	local useWorldRotation = false
+
 	if rotation then
 		if rotation.X == 0 and rotation.Y == 0 and rotation.Z == 0 then
 			useWorldRotation = true
-			rotationCFrame = CFrame.Angles(0, 0, 0)
 		else
 			rotationCFrame = CFrame.Angles(
 				math.rad(rotation.X),
@@ -201,13 +286,6 @@ local function playVFXAtPosition(vfxTemplate, relativePosition, rotation, target
 		end
 	end
 
-	local container = Instance.new("Part")
-	container.Name = "VFXContainer"
-	container.Size = Vector3.new(1, 1, 1)
-	container.Transparency = 1
-	container.CanCollide = false
-	container.Anchored = true
-
 	local worldPosition = (targetRootPart.CFrame * CFrame.new(relativePosition)).Position
 
 	if useWorldRotation then
@@ -215,77 +293,74 @@ local function playVFXAtPosition(vfxTemplate, relativePosition, rotation, target
 	else
 		container.CFrame = targetRootPart.CFrame * CFrame.new(relativePosition) * rotationCFrame
 	end
-	container.Parent = workspace
 
-	table.insert(activeVFXParts, container)
+	-- Process VFX (optimized - direct iteration)
+	for _, child in ipairs(vfxTemplate:GetChildren()) do
+		if child:IsA("Attachment") then
+			local attachmentClone = child:Clone()
+			attachmentClone.Parent = container
 
-	local function processVFX(obj, parent)
-		for _, child in ipairs(obj:GetChildren()) do
-			if child:IsA("Attachment") then
-				local attachmentClone = child:Clone()
-				attachmentClone.Parent = container
-
-				for _, emitter in ipairs(attachmentClone:GetChildren()) do
-					if emitter:IsA("ParticleEmitter") then
-						local emitCount = emitter:GetAttribute("EmitCount") or 20
-						emitter:Emit(emitCount)
-					end
+			for _, emitter in ipairs(attachmentClone:GetChildren()) do
+				if emitter:IsA("ParticleEmitter") then
+					emitter:Emit(emitter:GetAttribute("EmitCount") or 20)
 				end
-			elseif child:IsA("BasePart") then
-				local partClone = child:Clone()
-				partClone.CFrame = container.CFrame * child.CFrame
-				partClone.Anchored = true
-				partClone.CanCollide = false
-				partClone.Parent = container
-
-				table.insert(activeVFXParts, partClone)
-
-				processVFX(child, partClone)
-			elseif child:IsA("ParticleEmitter") then
-				local emitterClone = child:Clone()
-				emitterClone.Parent = container
-
-				local emitCount = emitterClone:GetAttribute("EmitCount") or 20
-				emitterClone:Emit(emitCount)
-			else
-				processVFX(child, parent)
 			end
+		elseif child:IsA("BasePart") then
+			local partClone = child:Clone()
+			partClone.CFrame = container.CFrame * child.CFrame
+			partClone.Anchored = true
+			partClone.CanCollide = false
+			partClone.Parent = container
+		elseif child:IsA("ParticleEmitter") then
+			local emitterClone = child:Clone()
+			emitterClone.Parent = container
+			emitterClone:Emit(emitterClone:GetAttribute("EmitCount") or 20)
 		end
 	end
 
-	processVFX(vfxClone, container)
-
-	vfxClone:Destroy()
-
-	Debris:AddItem(container, VFX_CLEANUP_TIME)
+	-- Schedule cleanup and return to pool
+	task.delay(VFX_CLEANUP_TIME, function()
+		returnVFXContainer(container)
+	end)
 end
 
--- Function to play preloaded audio instantly
+-- OPTIMIZATION: Instant audio playback
 local function playAudio(soundName, targetRootPart)
 	targetRootPart = targetRootPart or humanoidRootPart
 
 	local sound = preloadedSounds[soundName]
-	if sound then
-		-- Clone the sound for other characters, or use original for self
-		local soundToPlay = sound
-		if targetRootPart ~= humanoidRootPart then
-			soundToPlay = sound:Clone()
-			soundToPlay.Parent = targetRootPart
-		else
-			-- Stop if already playing to allow immediate replay
-			if sound.IsPlaying then
-				sound:Stop()
-			end
-		end
-		soundToPlay:Play()
+	if not sound then return end
 
-		-- Clean up cloned sounds
-		if soundToPlay ~= sound then
-			soundToPlay.Ended:Connect(function()
-				soundToPlay:Destroy()
-			end)
-			Debris:AddItem(soundToPlay, 10)
+	if targetRootPart ~= humanoidRootPart then
+		-- Clone for other characters
+		local soundClone = sound:Clone()
+		soundClone.Parent = targetRootPart
+		soundClone:Play()
+		Debris:AddItem(soundClone, soundClone.TimeLength + 1)
+	else
+		-- Reuse for self - stop and restart for instant replay
+		if sound.IsPlaying then
+			sound:Stop()
 		end
+		sound:Play()
+	end
+end
+
+-- VFX lookup table for cleaner code
+local VFX_CONFIG = {
+	Stab = {template = STAB_VFX, position = STAB_POSITION, rotation = nil},
+	Slash1 = {template = SLASH1_VFX, position = SLASH1_POSITION, rotation = SLASH1_ROTATION},
+	Slash3 = {template = SLASH3_VFX, position = SLASH3_POSITION, rotation = SLASH3_ROTATION},
+	Slash4 = {template = SLASH4_VFX, position = SLASH4_POSITION, rotation = nil},
+	Final = {template = FINAL_VFX, position = FINAL_POSITION, rotation = FINAL_ROTATION}
+}
+
+-- Unified VFX play function
+local function playVFX(vfxType, targetRootPart)
+	local config = VFX_CONFIG[vfxType]
+	if config then
+		playVFXAtPosition(config.template, config.position, config.rotation, targetRootPart)
+		playAudio(vfxType, targetRootPart)
 	end
 end
 
@@ -294,128 +369,47 @@ local function playVFXForCharacter(targetCharacter, vfxType)
 	if not targetCharacter or not targetCharacter.Parent then return end
 
 	local targetHumanoidRootPart = targetCharacter:FindFirstChild("HumanoidRootPart")
-	if not targetHumanoidRootPart then return end
-
-	-- Play the appropriate VFX at the target character's position
-	if vfxType == "Stab" then
-		playVFXAtPosition(STAB_VFX, STAB_POSITION, nil, targetHumanoidRootPart)
-		playAudio("Stab", targetHumanoidRootPart)
-	elseif vfxType == "Slash1" then
-		playVFXAtPosition(SLASH1_VFX, SLASH1_POSITION, SLASH1_ROTATION, targetHumanoidRootPart)
-		playAudio("Slash1", targetHumanoidRootPart)
-	elseif vfxType == "Slash3" then
-		playVFXAtPosition(SLASH3_VFX, SLASH3_POSITION, SLASH3_ROTATION, targetHumanoidRootPart)
-		playAudio("Slash3", targetHumanoidRootPart)
-	elseif vfxType == "Slash4" then
-		playVFXAtPosition(SLASH4_VFX, SLASH4_POSITION, nil, targetHumanoidRootPart)
-		playAudio("Slash4", targetHumanoidRootPart)
-	elseif vfxType == "Final" then
-		playVFXAtPosition(FINAL_VFX, FINAL_POSITION, FINAL_ROTATION, targetHumanoidRootPart)
-		playAudio("Final", targetHumanoidRootPart)
+	if targetHumanoidRootPart then
+		playVFX(vfxType, targetHumanoidRootPart)
 	end
 end
 
 -- Listen for VFX replication from server
 slashAbilityEvent.OnClientEvent:Connect(function(vfxType, targetCharacter)
-	if vfxType and targetCharacter then
-		-- Don't play for our own character (we already played it locally)
-		if targetCharacter ~= character then
-			playVFXForCharacter(targetCharacter, vfxType)
-		end
+	if vfxType and targetCharacter and targetCharacter ~= character then
+		playVFXForCharacter(targetCharacter, vfxType)
 	end
 end)
 
--- VFX functions with audio
-local function playSlash1VFX()
-	playVFXAtPosition(SLASH1_VFX, SLASH1_POSITION, SLASH1_ROTATION)
-	playAudio("Slash1")
-end
-
-local function playSlash3VFX()
-	playVFXAtPosition(SLASH3_VFX, SLASH3_POSITION, SLASH3_ROTATION)
-	playAudio("Slash3")
-end
-
-local function playSlash4VFX()
-	playVFXAtPosition(SLASH4_VFX, SLASH4_POSITION)
-	playAudio("Slash4")
-end
-
-local function playFinalVFX()
-	playVFXAtPosition(FINAL_VFX, FINAL_POSITION, FINAL_ROTATION)
-	playAudio("Final")
-end
-
-local function playStabVFX()
-	playVFXAtPosition(STAB_VFX, STAB_POSITION)
-	playAudio("Stab")
-end
-
--- Function to play animation
+-- OPTIMIZED: Animation playback using preloaded track
 local function playAnimation()
-	if isPlaying then
-		return
-	end
+	if isPlaying then return end
 
-	if ANIMATION_ID == "" then
-		warn("ANIMATION_ID is not set! Please set your animation ID in the script.")
-		return
+	if not preloadedAnimationTrack then
+		warn("Animation not preloaded! Attempting to reload...")
+		preloadAllAssets()
+		if not preloadedAnimationTrack then
+			warn("Failed to load animation. Check ANIMATION_ID.")
+			return
+		end
 	end
 
 	isPlaying = true
-
-	cleanupAllVFX()
-
 	setMovementLocked(true)
 
 	-- Notify server that ability started
 	slashAbilityEvent:FireServer("AbilityStart", character)
 
-	local animation = Instance.new("Animation")
-	animation.AnimationId = "rbxassetid://" .. ANIMATION_ID
-	animationTrack = humanoid:LoadAnimation(animation)
+	-- Play the preloaded animation track (instant!)
+	preloadedAnimationTrack:Play()
 
-	animationTrack:GetMarkerReachedSignal("Slash1"):Connect(function()
-		playStabVFX()
-		-- Notify server to replicate to all clients
-		slashAbilityEvent:FireServer("Stab", character)
-	end)
+	-- Wait for animation to end
+	preloadedAnimationTrack.Ended:Wait()
 
-	animationTrack:GetMarkerReachedSignal("Slash2"):Connect(function()
-		playSlash1VFX()
-		slashAbilityEvent:FireServer("Slash1", character)
-	end)
-
-	animationTrack:GetMarkerReachedSignal("Slash3"):Connect(function()
-		playSlash3VFX()
-		slashAbilityEvent:FireServer("Slash3", character)
-	end)
-
-	animationTrack:GetMarkerReachedSignal("Slash4"):Connect(function()
-		playSlash4VFX()
-		slashAbilityEvent:FireServer("Slash4", character)
-	end)
-
-	animationTrack:GetMarkerReachedSignal("Final"):Connect(function()
-		playFinalVFX()
-		slashAbilityEvent:FireServer("Final", character)
-	end)
-
-	animationTrack:Play()
-
-	animationTrack.Ended:Wait()
-
-	-- Notify server that ability ended (unlocks all hit players)
+	-- Notify server that ability ended
 	slashAbilityEvent:FireServer("AbilityEnd", character)
 
 	setMovementLocked(false)
-
-	if animationTrack then
-		animationTrack:Stop()
-		animationTrack:Destroy()
-		animationTrack = nil
-	end
-
 	isPlaying = false
 end
 
@@ -437,16 +431,8 @@ player.CharacterAdded:Connect(function(newCharacter)
 	originalJumpPower = humanoid.JumpPower
 	isPlaying = false
 
-	cleanupAllVFX()
-
-	if animationTrack then
-		animationTrack:Stop()
-		animationTrack:Destroy()
-		animationTrack = nil
-	end
-
 	setMovementLocked(false)
 
-	-- Repreload audio for new character
-	preloadAudio()
+	-- Reload all assets for new character
+	preloadAllAssets()
 end)
