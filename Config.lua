@@ -12,6 +12,9 @@ local Config = {}
 -- ============================================
 Config.Animation = {
 	ID = "125104321474109",
+	HitReactionID = "", -- Set this to your hit reaction animation ID
+	HitReactionSpeed = 1.5, -- Speed multiplier for hit reaction
+	HitReactionFadeTime = 0.1, -- Fade out time for hit reaction
 }
 
 -- ============================================
@@ -80,9 +83,12 @@ Config.Hitbox = {
 Config.Combat = {
 	DamagePerHit = 5,
 
-	-- Normal hit pushback
-	PushbackForce = 35,
-	PushbackDuration = 0.15,
+	-- Normal hit pushback (IMPROVED SMOOTHNESS)
+	PushbackForce = 30,
+	PushbackDuration = 0.2, -- Slightly longer for smoother feel
+	PushbackEasingStyle = Enum.EasingStyle.Quad, -- Smooth easing
+	PushbackEasingDirection = Enum.EasingDirection.Out, -- Ease out
+	UseSmoothPushback = true, -- Use TweenService instead of frame-by-frame
 
 	-- Final hit knockback & ragdoll
 	KnockbackUpVelocity = 100,
@@ -94,6 +100,11 @@ Config.Combat = {
 		Y = {Min = -4, Max = 4},
 		Z = {Min = -8, Max = 8},
 	},
+
+	-- Ragdoll smoothness settings
+	InstantRagdoll = true, -- Apply ragdoll immediately without delay
+	SmoothRecovery = true, -- Smooth transition when getting up
+	RecoveryTransitionTime = 0.2, -- Time to transition from ragdoll to normal
 }
 
 -- ============================================
@@ -104,7 +115,7 @@ Config.Highlight = {
 	OutlineColor = Color3.fromRGB(200, 0, 0),
 	FillTransparency = 0.3,
 	FlickerInTime = 0.025, -- Quick flash
-	FlickerOutTime = 0.05,
+	FlickerOutTime = 0.1,
 	BrightColor = Color3.fromRGB(255, 50, 50),
 	BrightOutlineColor = Color3.fromRGB(255, 0, 0),
 }

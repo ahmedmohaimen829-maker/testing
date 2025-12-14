@@ -1,19 +1,20 @@
 --[[
-	Slash Ability - Server Script (REFACTORED & SECURE)
+	Slash Ability - Server Script (ULTRA SMOOTH & OPTIMIZED)
 	Place this in ServerScriptService
 
 	Features:
+	- Smooth pushback with TweenService (no stuttering!)
+	- Hit reaction animations
+	- Fixed Final hit ragdoll consistency
+	- Instant ragdoll response with smooth recovery
 	- Server-side validation and anti-exploit protection
-	- Cooldown management
-	- Optimized hitbox detection
-	- Ragdoll system with smooth knockback
-	- Hit feedback replication
 	- Proper error handling
 ]]
 
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local RunService = game:GetService("RunService")
+local TweenService = game:GetService("TweenService")
 local Debris = game:GetService("Debris")
 
 -- ============================================
@@ -34,6 +35,8 @@ local slashAbilityEvent = reFolder:WaitForChild("SlashAbilityEvent")
 local activeAbilities = {} -- {[player] = abilityData}
 local playerCooldowns = {} -- {[player] = lastUseTime}
 local ragdolledCharacters = {} -- {[character] = ragdollData}
+local activePushbacks = {} -- {[character] = {tweens, connections}}
+local activeHitAnimations = {} -- {[character] = animationTrack}
 
 -- ============================================
 -- UTILITY FUNCTIONS
@@ -56,7 +59,6 @@ end
 -- VALIDATION
 -- ============================================
 local function validateAbilityStart(player, character)
-	-- Check cooldown
 	local currentTime = tick()
 	local lastUseTime = playerCooldowns[player] or 0
 
@@ -65,13 +67,11 @@ local function validateAbilityStart(player, character)
 		return false
 	end
 
-	-- Check if character belongs to player
 	if Players:GetPlayerFromCharacter(character) ~= player then
 		warn(string.format("[ANTI-EXPLOIT] Player %s sent invalid character", player.Name))
 		return false
 	end
 
-	-- Check if already active
 	if activeAbilities[player] then
 		warn(string.format("[ANTI-EXPLOIT] Player %s attempted to use ability while already active", player.Name))
 		return false
@@ -87,13 +87,11 @@ local function validateHitEvent(player, action)
 		return false
 	end
 
-	-- Check if ability has been active too long
 	if tick() - abilityData.startTime > Config.Validation.MaxAbilityDuration then
 		warn(string.format("[ANTI-EXPLOIT] Player %s ability exceeded max duration", player.Name))
 		return false
 	end
 
-	-- Check timing between hits (anti-spam)
 	if abilityData.lastHitTime then
 		if tick() - abilityData.lastHitTime < Config.Validation.MinTimeBetweenHits then
 			warn(string.format("[ANTI-EXPLOIT] Player %s hit events too frequent", player.Name))
@@ -101,7 +99,6 @@ local function validateHitEvent(player, action)
 		end
 	end
 
-	-- Check max hits
 	if abilityData.hitCount >= Config.Validation.MaxHitsPerAbility then
 		warn(string.format("[ANTI-EXPLOIT] Player %s exceeded max hits per ability", player.Name))
 		return false
@@ -144,8 +141,69 @@ local function unlockTargetMovement(targetCharacter, lockData)
 end
 
 -- ============================================
--- PUSHBACK SYSTEM
+-- HIT REACTION ANIMATION SYSTEM
 -- ============================================
+local function playHitReactionAnimation(targetCharacter)
+	if not targetCharacter or not targetCharacter.Parent then return end
+	if Config.Animation.HitReactionID == "" then return end
+
+	pcall(function()
+		local humanoid = targetCharacter:FindFirstChildOfClass("Humanoid")
+		if not humanoid then return end
+
+		-- Stop any existing hit animation
+		if activeHitAnimations[targetCharacter] then
+			activeHitAnimations[targetCharacter]:Stop(Config.Animation.HitReactionFadeTime)
+			activeHitAnimations[targetCharacter] = nil
+		end
+
+		-- Create and play hit reaction animation
+		local animation = Instance.new("Animation")
+		animation.AnimationId = "rbxassetid://" .. Config.Animation.HitReactionID
+
+		local animTrack = humanoid:LoadAnimation(animation)
+		animTrack:Play(Config.Animation.HitReactionFadeTime, 1, Config.Animation.HitReactionSpeed)
+
+		activeHitAnimations[targetCharacter] = animTrack
+
+		-- Clean up after animation
+		task.delay(animTrack.Length / Config.Animation.HitReactionSpeed + 0.1, function()
+			if activeHitAnimations[targetCharacter] == animTrack then
+				activeHitAnimations[targetCharacter] = nil
+			end
+		end)
+	end)
+end
+
+-- ============================================
+-- SMOOTH PUSHBACK SYSTEM (FIXED STUTTERING!)
+-- ============================================
+local function cleanupPushback(targetCharacter)
+	local pushbackData = activePushbacks[targetCharacter]
+	if not pushbackData then return end
+
+	-- Stop all tweens
+	for _, tween in ipairs(pushbackData.tweens or {}) do
+		if tween then
+			tween:Cancel()
+		end
+	end
+
+	-- Disconnect connections
+	for _, connection in ipairs(pushbackData.connections or {}) do
+		if connection then
+			connection:Disconnect()
+		end
+	end
+
+	-- Destroy velocity object
+	if pushbackData.bodyVelocity and pushbackData.bodyVelocity.Parent then
+		pushbackData.bodyVelocity:Destroy()
+	end
+
+	activePushbacks[targetCharacter] = nil
+end
+
 local function applyPushback(targetCharacter, abilityOwnerRootPart)
 	if not targetCharacter or not targetCharacter.Parent then return end
 	if not abilityOwnerRootPart or not abilityOwnerRootPart.Parent then return end
@@ -154,52 +212,90 @@ local function applyPushback(targetCharacter, abilityOwnerRootPart)
 		local targetRootPart = targetCharacter:FindFirstChild("HumanoidRootPart")
 		if not targetRootPart then return end
 
+		-- Clean up any existing pushback
+		cleanupPushback(targetCharacter)
+
 		-- Calculate push direction
 		local direction = (targetRootPart.Position - abilityOwnerRootPart.Position)
 		if direction.Magnitude < 0.1 then return end
 
 		direction = (direction.Unit * Vector3.new(1, 0, 1)) -- Flatten Y
 
-		-- Apply instant pushback
 		local pushbackVelocity = direction * Config.Combat.PushbackForce
-		local currentVelocity = targetRootPart.AssemblyLinearVelocity
 
-		targetRootPart.AssemblyLinearVelocity = Vector3.new(
-			pushbackVelocity.X,
-			currentVelocity.Y,
-			pushbackVelocity.Z
-		)
+		if Config.Combat.UseSmoothPushback then
+			-- SMOOTH METHOD: Using BodyVelocity with TweenService (BUTTER SMOOTH!)
+			local bodyVelocity = Instance.new("BodyVelocity")
+			bodyVelocity.MaxForce = Vector3.new(math.huge, 0, math.huge) -- Only horizontal
+			bodyVelocity.Velocity = pushbackVelocity
+			bodyVelocity.P = 10000
+			bodyVelocity.Parent = targetRootPart
 
-		-- Decay pushback over time
-		task.spawn(function()
-			local startTime = tick()
-			while tick() - startTime < Config.Combat.PushbackDuration do
-				if not targetRootPart or not targetRootPart.Parent then break end
+			-- Tween velocity to zero smoothly
+			local tweenInfo = TweenInfo.new(
+				Config.Combat.PushbackDuration,
+				Config.Combat.PushbackEasingStyle,
+				Config.Combat.PushbackEasingDirection
+			)
 
-				local progress = (tick() - startTime) / Config.Combat.PushbackDuration
-				local decayFactor = 1 - progress
+			local tween = TweenService:Create(bodyVelocity, tweenInfo, {
+				Velocity = Vector3.zero
+			})
 
-				local currentVel = targetRootPart.AssemblyLinearVelocity
-				targetRootPart.AssemblyLinearVelocity = Vector3.new(
-					pushbackVelocity.X * decayFactor,
-					currentVel.Y,
-					pushbackVelocity.Z * decayFactor
-				)
+			-- Store for cleanup
+			activePushbacks[targetCharacter] = {
+				bodyVelocity = bodyVelocity,
+				tweens = {tween},
+				connections = {}
+			}
 
-				task.wait()
-			end
+			tween:Play()
 
-			-- Stop horizontal movement
-			if targetRootPart and targetRootPart.Parent then
-				local finalVel = targetRootPart.AssemblyLinearVelocity
-				targetRootPart.AssemblyLinearVelocity = Vector3.new(0, finalVel.Y, 0)
-			end
-		end)
+			-- Clean up after tween completes
+			tween.Completed:Connect(function()
+				cleanupPushback(targetCharacter)
+			end)
+		else
+			-- LEGACY METHOD: Direct velocity manipulation (kept as fallback)
+			local currentVelocity = targetRootPart.AssemblyLinearVelocity
+			targetRootPart.AssemblyLinearVelocity = Vector3.new(
+				pushbackVelocity.X,
+				currentVelocity.Y,
+				pushbackVelocity.Z
+			)
+
+			task.spawn(function()
+				local startTime = tick()
+				while tick() - startTime < Config.Combat.PushbackDuration do
+					if not targetRootPart or not targetRootPart.Parent then break end
+
+					local progress = (tick() - startTime) / Config.Combat.PushbackDuration
+					local decayFactor = 1 - progress
+
+					local currentVel = targetRootPart.AssemblyLinearVelocity
+					targetRootPart.AssemblyLinearVelocity = Vector3.new(
+						pushbackVelocity.X * decayFactor,
+						currentVel.Y,
+						pushbackVelocity.Z * decayFactor
+					)
+
+					task.wait()
+				end
+
+				if targetRootPart and targetRootPart.Parent then
+					local finalVel = targetRootPart.AssemblyLinearVelocity
+					targetRootPart.AssemblyLinearVelocity = Vector3.new(0, finalVel.Y, 0)
+				end
+			end)
+		end
+
+		-- Play hit reaction animation
+		playHitReactionAnimation(targetCharacter)
 	end)
 end
 
 -- ============================================
--- RAGDOLL SYSTEM
+-- RAGDOLL SYSTEM (IMPROVED CONSISTENCY)
 -- ============================================
 local function getMotor6Ds(character)
 	local motors = {}
@@ -238,20 +334,28 @@ local function createRagdollConstraint(motor)
 end
 
 local function enableRagdoll(character)
-	if ragdolledCharacters[character] then return false end
+	-- Prevent duplicate ragdolls
+	if ragdolledCharacters[character] then
+		print("Ragdoll already active for", character.Name)
+		return false
+	end
 
 	local success, ragdollData = pcall(function()
 		local humanoid = character:FindFirstChildOfClass("Humanoid")
-		if not humanoid or humanoid.Health <= 0 then return nil end
+		if not humanoid or humanoid.Health <= 0 then
+			print("Invalid humanoid for ragdoll")
+			return nil
+		end
 
 		local data = {
 			motors = {},
 			sockets = {},
 			attachments = {},
-			constraints = {}
+			constraints = {},
+			humanoid = humanoid
 		}
 
-		-- Disable humanoid states
+		-- INSTANT RAGDOLL: Disable humanoid states immediately
 		humanoid:SetStateEnabled(Enum.HumanoidStateType.GettingUp, false)
 		humanoid:SetStateEnabled(Enum.HumanoidStateType.Jumping, false)
 		humanoid:SetStateEnabled(Enum.HumanoidStateType.Running, false)
@@ -259,10 +363,12 @@ local function enableRagdoll(character)
 		humanoid:SetStateEnabled(Enum.HumanoidStateType.FallingDown, true)
 		humanoid:ChangeState(Enum.HumanoidStateType.Physics)
 		humanoid.PlatformStand = true
+		humanoid.AutoRotate = false
 
-		-- Process motors
+		-- Process motors INSTANTLY
 		local motors = getMotor6Ds(character)
 		for _, motor in ipairs(motors) do
+			-- Don't disable RootJoint for better stability
 			if motor.Name ~= "RootJoint" and motor.Name ~= "Root" then
 				table.insert(data.motors, {
 					motor = motor,
@@ -278,21 +384,24 @@ local function enableRagdoll(character)
 			end
 		end
 
-		-- Enable collision
+		-- Enable collision for physics
 		if Config.Ragdoll.EnableCollisionOnParts then
 			for _, part in ipairs(character:GetDescendants()) do
-				if part:IsA("BasePart") then
+				if part:IsA("BasePart") and part.Name ~= "HumanoidRootPart" then
 					part.CanCollide = true
 				end
 			end
 		end
 
+		print("Ragdoll enabled successfully for", character.Name)
 		return data
 	end)
 
 	if success and ragdollData then
 		ragdolledCharacters[character] = ragdollData
 		return true
+	else
+		warn("Failed to enable ragdoll:", ragdollData)
 	end
 
 	return false
@@ -303,22 +412,57 @@ local function disableRagdoll(character)
 	if not ragdollData then return end
 
 	pcall(function()
-		local humanoid = character:FindFirstChildOfClass("Humanoid")
+		local humanoid = ragdollData.humanoid or character:FindFirstChildOfClass("Humanoid")
 		local rootPart = character:FindFirstChild("HumanoidRootPart")
 
-		-- Clean up constraints
+		-- Clean up constraints FIRST
 		for _, constraint in ipairs(ragdollData.constraints) do
 			if constraint and constraint.Parent then
 				constraint:Destroy()
 			end
 		end
 
-		-- Stop all movement
-		if rootPart then
-			rootPart.AssemblyLinearVelocity = Vector3.zero
-			rootPart.AssemblyAngularVelocity = Vector3.zero
+		-- SMOOTH RECOVERY: Gradual velocity reduction
+		if Config.Combat.SmoothRecovery and rootPart then
+			local currentVel = rootPart.AssemblyLinearVelocity
+			local currentAngVel = rootPart.AssemblyAngularVelocity
+
+			-- Tween to zero velocity
+			local tweenInfo = TweenInfo.new(
+				Config.Combat.RecoveryTransitionTime,
+				Enum.EasingStyle.Quad,
+				Enum.EasingDirection.Out
+			)
+
+			-- Create temporary part to tween (we'll manually apply values)
+			task.spawn(function()
+				local startTime = tick()
+				while tick() - startTime < Config.Combat.RecoveryTransitionTime do
+					if not rootPart or not rootPart.Parent then break end
+
+					local alpha = (tick() - startTime) / Config.Combat.RecoveryTransitionTime
+					local smoothAlpha = 1 - math.pow(1 - alpha, 2) -- Ease out
+
+					rootPart.AssemblyLinearVelocity = currentVel * (1 - smoothAlpha)
+					rootPart.AssemblyAngularVelocity = currentAngVel * (1 - smoothAlpha)
+
+					task.wait()
+				end
+
+				if rootPart and rootPart.Parent then
+					rootPart.AssemblyLinearVelocity = Vector3.zero
+					rootPart.AssemblyAngularVelocity = Vector3.zero
+				end
+			end)
+		else
+			-- Stop all movement instantly
+			if rootPart then
+				rootPart.AssemblyLinearVelocity = Vector3.zero
+				rootPart.AssemblyAngularVelocity = Vector3.zero
+			end
 		end
 
+		-- Stop velocity on all parts
 		for _, part in ipairs(character:GetDescendants()) do
 			if part:IsA("BasePart") then
 				part.AssemblyLinearVelocity = Vector3.zero
@@ -375,24 +519,30 @@ local function disableRagdoll(character)
 		-- Re-enable humanoid control
 		if humanoid then
 			humanoid.PlatformStand = false
+			humanoid.AutoRotate = true
 			humanoid:SetStateEnabled(Enum.HumanoidStateType.GettingUp, true)
 			humanoid:SetStateEnabled(Enum.HumanoidStateType.Jumping, true)
 			humanoid:SetStateEnabled(Enum.HumanoidStateType.Running, true)
 			humanoid:SetStateEnabled(Enum.HumanoidStateType.RunningNoPhysics, true)
 			humanoid:ChangeState(Enum.HumanoidStateType.GettingUp)
 		end
+
+		print("Ragdoll disabled for", character.Name)
 	end)
 
 	ragdolledCharacters[character] = nil
 end
 
 -- ============================================
--- KNOCKBACK SYSTEM (Final Hit)
+-- FINAL KNOCKBACK (IMPROVED CONSISTENCY)
 -- ============================================
 local function applyFinalKnockback(character, hitPosition, ragdollData)
 	pcall(function()
 		local rootPart = character:FindFirstChild("HumanoidRootPart")
-		if not rootPart then return end
+		if not rootPart then
+			warn("No HumanoidRootPart for final knockback")
+			return
+		end
 
 		-- Calculate direction
 		local direction = (rootPart.Position - hitPosition)
@@ -448,6 +598,8 @@ local function applyFinalKnockback(character, hitPosition, ragdollData)
 			table.insert(ragdollData.constraints, angularVelocity)
 		end
 
+		print("Applied final knockback to", character.Name)
+
 		-- Decay knockback over time
 		task.spawn(function()
 			local duration = Config.Combat.KnockbackDecayTime
@@ -482,18 +634,37 @@ local function applyFinalKnockback(character, hitPosition, ragdollData)
 end
 
 local function knockbackAndRagdoll(character, hitPosition)
-	if ragdolledCharacters[character] then return end
+	-- Prevent duplicate ragdolls
+	if ragdolledCharacters[character] then
+		print("Character already ragdolled, skipping")
+		return
+	end
 
 	local humanoid = character:FindFirstChildOfClass("Humanoid")
-	if not humanoid or humanoid.Health <= 0 then return end
+	if not humanoid or humanoid.Health <= 0 then
+		print("Invalid humanoid, skipping ragdoll")
+		return
+	end
 
-	-- Enable ragdoll
+	print("Attempting to ragdoll and knockback:", character.Name)
+
+	-- Clean up any active pushback first
+	cleanupPushback(character)
+
+	-- Enable ragdoll INSTANTLY
 	local success = enableRagdoll(character)
-	if not success then return end
+	if not success then
+		warn("Failed to enable ragdoll for", character.Name)
+		return
+	end
 
-	-- Apply knockback
+	-- Apply knockback IMMEDIATELY after ragdoll
 	local ragdollData = ragdolledCharacters[character]
-	applyFinalKnockback(character, hitPosition, ragdollData)
+	if ragdollData then
+		applyFinalKnockback(character, hitPosition, ragdollData)
+	else
+		warn("Ragdoll data not found after enabling ragdoll")
+	end
 
 	-- Schedule recovery
 	task.delay(Config.Combat.RagdollDuration, function()
@@ -579,8 +750,10 @@ local function createHitbox(abilityOwner, character, humanoidRootPart, vfxType)
 							-- Apply damage
 							targetHumanoid.Health = math.max(0, targetHumanoid.Health - Config.Combat.DamagePerHit)
 
-							-- Special handling for Final hit
+							-- SPECIAL HANDLING FOR FINAL HIT (FIXED CONSISTENCY)
 							if vfxType == Config.Network.Actions.Final then
+								print("Final hit detected on:", targetPlayer.Name)
+
 								-- Unlock if previously locked
 								if abilityData.hitPlayers[targetPlayer] then
 									local hitData = abilityData.hitPlayers[targetPlayer]
@@ -589,7 +762,7 @@ local function createHitbox(abilityOwner, character, humanoidRootPart, vfxType)
 									end
 								end
 
-								-- Apply ragdoll and knockback
+								-- Apply ragdoll and knockback (INSTANT, NO DELAY)
 								knockbackAndRagdoll(targetCharacter, humanoidRootPart.Position)
 
 								-- Hit feedback
@@ -614,7 +787,7 @@ local function createHitbox(abilityOwner, character, humanoidRootPart, vfxType)
 									end
 								end
 
-								-- Apply pushback
+								-- Apply smooth pushback
 								applyPushback(targetCharacter, humanoidRootPart)
 
 								-- Hit feedback
@@ -656,10 +829,8 @@ slashAbilityEvent.OnServerEvent:Connect(function(player, action, character)
 			return
 		end
 
-		-- Record cooldown
 		playerCooldowns[player] = tick()
 
-		-- Create ability data
 		activeAbilities[player] = {
 			character = character,
 			startTime = tick(),
@@ -686,7 +857,7 @@ slashAbilityEvent.OnServerEvent:Connect(function(player, action, character)
 		return
 	end
 
-	-- Handle hit events (Stab, Slash1, Slash3, Slash4, Final)
+	-- Handle hit events
 	if not validateHitEvent(player, action) then
 		return
 	end
@@ -715,7 +886,6 @@ end)
 -- CLEANUP ON PLAYER LEAVE
 -- ============================================
 Players.PlayerRemoving:Connect(function(player)
-	-- Clean up active ability
 	if activeAbilities[player] then
 		local abilityData = activeAbilities[player]
 
@@ -728,36 +898,37 @@ Players.PlayerRemoving:Connect(function(player)
 		activeAbilities[player] = nil
 	end
 
-	-- Clean up cooldown
 	playerCooldowns[player] = nil
 
-	-- Clean up ragdoll
 	local character = player.Character
-	if character and ragdolledCharacters[character] then
-		disableRagdoll(character)
+	if character then
+		if ragdolledCharacters[character] then
+			disableRagdoll(character)
+		end
+		cleanupPushback(character)
 	end
 end)
 
 -- ============================================
 -- CHARACTER CLEANUP
 -- ============================================
-Players.PlayerAdded:Connect(function(player)
+local function setupCharacterCleanup(player)
 	player.CharacterRemoving:Connect(function(character)
 		if ragdolledCharacters[character] then
 			disableRagdoll(character)
 		end
+		cleanupPushback(character)
+		if activeHitAnimations[character] then
+			activeHitAnimations[character]:Stop()
+			activeHitAnimations[character] = nil
+		end
 	end)
-end)
-
--- Existing players
-for _, player in ipairs(Players:GetPlayers()) do
-	if player.Character then
-		player.CharacterRemoving:Connect(function(character)
-			if ragdolledCharacters[character] then
-				disableRagdoll(character)
-			end
-		end)
-	end
 end
 
-print("✓ Slash Ability Server initialized successfully")
+Players.PlayerAdded:Connect(setupCharacterCleanup)
+
+for _, player in ipairs(Players:GetPlayers()) do
+	setupCharacterCleanup(player)
+end
+
+print("✓ Slash Ability Server initialized successfully (ULTRA SMOOTH)")
