@@ -46,13 +46,12 @@ local lastUseTime = 0
 local vfxHandler = nil
 
 -- Movement lock instances and state
-local originalWalkSpeed = humanoid.WalkSpeed
-local originalJumpPower = humanoid.JumpPower
-local alignPositionInstance = nil
-local alignAttachment = nil
-local lockAttachment = nil
-local lockConnection = nil
-local lockedCFrame = nil
+local DEFAULT_WALKSPEED = 16 -- Fallback if we can't get original
+local DEFAULT_JUMPPOWER = 50 -- Fallback if we can't get original
+local originalWalkSpeed = math.max(humanoid.WalkSpeed, DEFAULT_WALKSPEED) -- Never store 0
+local originalJumpPower = math.max(humanoid.JumpPower, DEFAULT_JUMPPOWER) -- Never store 0
+local bodyPosition = nil
+local bodyGyro = nil
 local movementLocked = false
 
 -- ============================================
@@ -72,62 +71,49 @@ local function initialize()
 end
 
 -- ============================================
--- MOVEMENT LOCKING (ROBUST SYSTEM)
+-- MOVEMENT LOCKING (SIMPLIFIED & RELIABLE)
 -- ============================================
 local function cleanupMovementLock()
-	-- Disconnect continuous enforcement
-	if lockConnection then
-		lockConnection:Disconnect()
-		lockConnection = nil
+	-- Clean up BodyPosition
+	if bodyPosition and bodyPosition.Parent then
+		bodyPosition:Destroy()
 	end
+	bodyPosition = nil
 
-	-- Clean up position lock instances
-	if alignPositionInstance and alignPositionInstance.Parent then
-		alignPositionInstance:Destroy()
+	-- Clean up BodyGyro
+	if bodyGyro and bodyGyro.Parent then
+		bodyGyro:Destroy()
 	end
-	alignPositionInstance = nil
-
-	if alignAttachment and alignAttachment.Parent then
-		alignAttachment:Destroy()
-	end
-	alignAttachment = nil
-
-	if lockAttachment and lockAttachment.Parent then
-		lockAttachment:Destroy()
-	end
-	lockAttachment = nil
-
-	lockedCFrame = nil
+	bodyGyro = nil
 end
 
 local function setMovementLocked(locked)
-	local success, err = pcall(function()
-		if locked then
-			if movementLocked then
-				warn("Movement already locked!")
-				return
-			end
+	if locked then
+		if movementLocked then
+			return -- Already locked, skip
+		end
 
+		local success, err = pcall(function()
 			movementLocked = true
 			print("[MOVEMENT LOCK] Locking movement...")
 
-			-- Store original values
-			originalWalkSpeed = humanoid.WalkSpeed
-			originalJumpPower = humanoid.JumpPower
+			-- Store original values (NEVER store 0!)
+			local currentWalkSpeed = humanoid.WalkSpeed
+			local currentJumpPower = humanoid.JumpPower
 
-			-- Store current position/rotation for enforcement
-			lockedCFrame = humanoidRootPart.CFrame
+			if currentWalkSpeed > 0 then
+				originalWalkSpeed = currentWalkSpeed
+			end
+			if currentJumpPower > 0 then
+				originalJumpPower = currentJumpPower
+			end
 
-			-- STEP 1: Disable all movement-related humanoid states
+			-- STEP 1: Disable movement-related humanoid states
 			humanoid:SetStateEnabled(Enum.HumanoidStateType.Running, false)
 			humanoid:SetStateEnabled(Enum.HumanoidStateType.RunningNoPhysics, false)
 			humanoid:SetStateEnabled(Enum.HumanoidStateType.Climbing, false)
 			humanoid:SetStateEnabled(Enum.HumanoidStateType.StrafingNoPhysics, false)
-			humanoid:SetStateEnabled(Enum.HumanoidStateType.Ragdoll, false)
-			humanoid:SetStateEnabled(Enum.HumanoidStateType.GettingUp, false)
 			humanoid:SetStateEnabled(Enum.HumanoidStateType.Jumping, false)
-			humanoid:SetStateEnabled(Enum.HumanoidStateType.Landed, false)
-			humanoid:SetStateEnabled(Enum.HumanoidStateType.Flying, false)
 			humanoid:SetStateEnabled(Enum.HumanoidStateType.Freefall, false)
 			humanoid:SetStateEnabled(Enum.HumanoidStateType.Swimming, false)
 
@@ -136,111 +122,81 @@ local function setMovementLocked(locked)
 			humanoid.JumpPower = 0
 			humanoid.JumpHeight = 0
 
-			-- STEP 3: Create AlignPosition for position locking
-			local lockPosition = humanoidRootPart.Position
+			-- STEP 3: Create BodyPosition to anchor player in place
+			bodyPosition = Instance.new("BodyPosition")
+			bodyPosition.Name = "MovementLock_Position"
+			bodyPosition.Position = humanoidRootPart.Position
+			bodyPosition.MaxForce = Vector3.new(400000, 400000, 400000)
+			bodyPosition.P = 10000
+			bodyPosition.D = 500
+			bodyPosition.Parent = humanoidRootPart
 
-			lockAttachment = Instance.new("Attachment")
-			lockAttachment.Name = "LockAttachment"
-			lockAttachment.WorldPosition = lockPosition
-			lockAttachment.Parent = workspace.Terrain
-
-			alignAttachment = Instance.new("Attachment")
-			alignAttachment.Name = "MovementLockAttachment"
-			alignAttachment.Parent = humanoidRootPart
-
-			alignPositionInstance = Instance.new("AlignPosition")
-			alignPositionInstance.Name = "MovementLock"
-			alignPositionInstance.Mode = Enum.PositionAlignmentMode.TwoAttachment
-			alignPositionInstance.Attachment0 = alignAttachment
-			alignPositionInstance.Attachment1 = lockAttachment
-			alignPositionInstance.RigidityEnabled = Config.MovementLock.RigidityEnabled
-			alignPositionInstance.MaxForce = math.huge
-			alignPositionInstance.Responsiveness = Config.MovementLock.Responsiveness
-			alignPositionInstance.Parent = humanoidRootPart
-
-			-- STEP 4: Continuous enforcement - force position every frame
-			lockConnection = RunService.Heartbeat:Connect(function()
-				if not movementLocked then
-					if lockConnection then
-						lockConnection:Disconnect()
-						lockConnection = nil
-					end
-					return
-				end
-
-				-- Enforce movement properties
-				if humanoid.WalkSpeed ~= 0 then
-					humanoid.WalkSpeed = 0
-				end
-				if humanoid.JumpPower ~= 0 then
-					humanoid.JumpPower = 0
-				end
-
-				-- Enforce position (keep rotation but lock position)
-				if lockedCFrame and humanoidRootPart then
-					local currentRotation = humanoidRootPart.CFrame - humanoidRootPart.CFrame.Position
-					humanoidRootPart.CFrame = CFrame.new(lockedCFrame.Position) * currentRotation
-
-					-- Zero out velocity to prevent drift
-					humanoidRootPart.AssemblyLinearVelocity = Vector3.new(
-						0,
-						humanoidRootPart.AssemblyLinearVelocity.Y, -- Keep Y velocity for animations
-						0
-					)
-				end
-			end)
+			-- STEP 4: Create BodyGyro to allow rotation but lock position
+			bodyGyro = Instance.new("BodyGyro")
+			bodyGyro.Name = "MovementLock_Gyro"
+			bodyGyro.MaxTorque = Vector3.new(0, 400000, 0) -- Only Y-axis (allow looking around)
+			bodyGyro.P = 3000
+			bodyGyro.CFrame = humanoidRootPart.CFrame
+			bodyGyro.Parent = humanoidRootPart
 
 			print("[MOVEMENT LOCK] Movement locked successfully")
-		else
-			if not movementLocked then
-				warn("Movement already unlocked!")
-				return
-			end
+		end)
 
+		if not success then
+			warn("[MOVEMENT LOCK] ERROR during lock:", err)
 			movementLocked = false
+			cleanupMovementLock()
+		end
+	else
+		if not movementLocked then
+			return -- Already unlocked, skip
+		end
+
+		local success, err = pcall(function()
 			print("[MOVEMENT LOCK] Unlocking movement...")
 
-			-- Clean up enforcement and instances
+			-- CRITICAL: Set flag FIRST to prevent any interference
+			movementLocked = false
+
+			-- STEP 1: Clean up physics constraints IMMEDIATELY
 			cleanupMovementLock()
 
-			-- Re-enable all humanoid states
+			-- STEP 2: Re-enable humanoid states
 			humanoid:SetStateEnabled(Enum.HumanoidStateType.Running, true)
 			humanoid:SetStateEnabled(Enum.HumanoidStateType.RunningNoPhysics, true)
 			humanoid:SetStateEnabled(Enum.HumanoidStateType.Climbing, true)
 			humanoid:SetStateEnabled(Enum.HumanoidStateType.StrafingNoPhysics, true)
-			humanoid:SetStateEnabled(Enum.HumanoidStateType.Ragdoll, true)
-			humanoid:SetStateEnabled(Enum.HumanoidStateType.GettingUp, true)
 			humanoid:SetStateEnabled(Enum.HumanoidStateType.Jumping, true)
-			humanoid:SetStateEnabled(Enum.HumanoidStateType.Landed, true)
-			humanoid:SetStateEnabled(Enum.HumanoidStateType.Flying, true)
 			humanoid:SetStateEnabled(Enum.HumanoidStateType.Freefall, true)
 			humanoid:SetStateEnabled(Enum.HumanoidStateType.Swimming, true)
 
-			-- Restore movement properties
+			-- STEP 3: Restore movement properties (NO task.wait()!)
 			humanoid.WalkSpeed = originalWalkSpeed
 			humanoid.JumpPower = originalJumpPower
-			if humanoid.JumpHeight == 0 then
-				humanoid.JumpHeight = 7.2 -- Default Roblox value
-			end
+			humanoid.JumpHeight = 7.2
 
-			-- Verify restoration worked
-			task.wait()
+			-- STEP 4: Immediate verification (synchronous, no delays)
 			if humanoid.WalkSpeed == 0 then
-				warn("[MOVEMENT LOCK] WalkSpeed still 0 after unlock! Force restoring...")
-				humanoid.WalkSpeed = originalWalkSpeed or 16
+				warn("[MOVEMENT LOCK] WalkSpeed is 0! Using default:", DEFAULT_WALKSPEED)
+				humanoid.WalkSpeed = DEFAULT_WALKSPEED
+			end
+			if humanoid.JumpPower == 0 then
+				humanoid.JumpPower = DEFAULT_JUMPPOWER
 			end
 
-			print("[MOVEMENT LOCK] Movement unlocked successfully - WalkSpeed:", humanoid.WalkSpeed)
-		end
-	end)
+			print("[MOVEMENT LOCK] Movement unlocked - WalkSpeed:", humanoid.WalkSpeed, "JumpPower:", humanoid.JumpPower)
+		end)
 
-	if not success then
-		warn("[MOVEMENT LOCK] ERROR:", err)
-		-- Emergency cleanup
-		movementLocked = false
-		cleanupMovementLock()
-		humanoid.WalkSpeed = originalWalkSpeed or 16
-		humanoid.JumpPower = originalJumpPower or 50
+		if not success then
+			warn("[MOVEMENT LOCK] ERROR during unlock:", err)
+			-- Emergency restoration
+			movementLocked = false
+			cleanupMovementLock()
+			humanoid.WalkSpeed = DEFAULT_WALKSPEED
+			humanoid.JumpPower = DEFAULT_JUMPPOWER
+			humanoid:SetStateEnabled(Enum.HumanoidStateType.Running, true)
+			humanoid:SetStateEnabled(Enum.HumanoidStateType.Jumping, true)
+		end
 	end
 end
 
@@ -275,22 +231,25 @@ local function setupMovementLockFailsafes()
 	-- Failsafe 1: Death detection
 	local deathConnection = humanoid.Died:Connect(function()
 		if movementLocked then
-			warn("[MOVEMENT LOCK] Player died while locked - emergency cleanup!")
+			warn("[FAILSAFE] Player died during ability - emergency cleanup!")
 			movementLocked = false
 			cleanupMovementLock()
+			humanoid.WalkSpeed = DEFAULT_WALKSPEED
+			humanoid.JumpPower = DEFAULT_JUMPPOWER
 		end
 	end)
 
 	-- Failsafe 2: Maximum duration timeout (safety net)
-	task.delay(10, function() -- 10 seconds max for any ability
+	local timeoutConnection
+	timeoutConnection = task.delay(8, function() -- 8 seconds max (abilities should be ~3-4s)
 		if movementLocked then
-			warn("[MOVEMENT LOCK] Movement lock exceeded max duration - emergency unlock!")
+			warn("[FAILSAFE] Ability exceeded max duration - forcing unlock!")
 			setMovementLocked(false)
 		end
 	end)
 
-	-- Return death connection so it can be cleaned up
-	return deathConnection
+	-- Return connections for cleanup
+	return deathConnection, timeoutConnection
 end
 
 -- ============================================
@@ -317,6 +276,7 @@ local function playAnimation()
 	end
 
 	local deathConnection = nil
+	local timeoutConnection = nil
 	local success, err = pcall(function()
 		isPlaying = true
 		-- DON'T set lastUseTime here - wait until ability ends!
@@ -325,7 +285,7 @@ local function playAnimation()
 		vfxHandler:CleanupAllVFX()
 
 		-- Setup failsafes BEFORE locking movement
-		deathConnection = setupMovementLockFailsafes()
+		deathConnection, timeoutConnection = setupMovementLockFailsafes()
 
 		-- Lock movement
 		setMovementLocked(true)
@@ -386,9 +346,12 @@ local function playAnimation()
 			animationTrack = nil
 		end
 
-		-- Clean up death connection
+		-- Clean up failsafe connections
 		if deathConnection then
 			deathConnection:Disconnect()
+		end
+		if timeoutConnection then
+			task.cancel(timeoutConnection)
 		end
 
 		isPlaying = false
@@ -409,8 +372,12 @@ local function playAnimation()
 			animationTrack = nil
 		end
 
+		-- Clean up failsafe connections
 		if deathConnection then
 			deathConnection:Disconnect()
+		end
+		if timeoutConnection then
+			task.cancel(timeoutConnection)
 		end
 	end
 end
@@ -443,15 +410,19 @@ player.CharacterAdded:Connect(function(newCharacter)
 	humanoid = newCharacter:WaitForChild("Humanoid")
 	humanoidRootPart = newCharacter:WaitForChild("HumanoidRootPart")
 
-	-- Reset state
-	originalWalkSpeed = humanoid.WalkSpeed
-	originalJumpPower = humanoid.JumpPower
+	-- Reset state with safe defaults
+	originalWalkSpeed = math.max(humanoid.WalkSpeed, DEFAULT_WALKSPEED)
+	originalJumpPower = math.max(humanoid.JumpPower, DEFAULT_JUMPPOWER)
 	isPlaying = false
 	lastUseTime = 0
 	movementLocked = false
 
 	-- Emergency cleanup of movement lock
 	cleanupMovementLock()
+
+	-- Ensure movement is enabled
+	humanoid.WalkSpeed = originalWalkSpeed
+	humanoid.JumpPower = originalJumpPower
 
 	-- Clean up old VFX handler
 	if vfxHandler then
@@ -469,7 +440,7 @@ player.CharacterAdded:Connect(function(newCharacter)
 		animationTrack = nil
 	end
 
-	print("[CHARACTER RESPAWN] Character respawned, all state reset")
+	print("[CHARACTER RESPAWN] Character respawned - WalkSpeed:", originalWalkSpeed)
 end)
 
 -- ============================================
