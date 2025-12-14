@@ -92,7 +92,10 @@ local function validateHitEvent(player, action)
 		return false
 	end
 
-	if abilityData.lastHitTime then
+	-- CRITICAL FIX: Allow Final hit to bypass timing check (it's the last hit, timing doesn't matter)
+	local isFinalHit = (action == Config.Network.Actions.Final)
+
+	if abilityData.lastHitTime and not isFinalHit then
 		if tick() - abilityData.lastHitTime < Config.Validation.MinTimeBetweenHits then
 			warn(string.format("[ANTI-EXPLOIT] Player %s hit events too frequent", player.Name))
 			return false
