@@ -334,10 +334,10 @@ local function createRagdollConstraint(motor)
 end
 
 local function enableRagdoll(character)
-	-- Prevent duplicate ragdolls
+	-- FIX #3: Check moved to caller, but keep as safety (return true if already exists)
 	if ragdolledCharacters[character] then
-		print("Ragdoll already active for", character.Name)
-		return false
+		print("Ragdoll already active for", character.Name, "- returning true")
+		return true -- Return true because ragdoll IS active, just already exists
 	end
 
 	local success, ragdollData = pcall(function()
@@ -355,15 +355,23 @@ local function enableRagdoll(character)
 			humanoid = humanoid
 		}
 
-		-- INSTANT RAGDOLL: Disable humanoid states immediately
+		-- FIX #2: FORCE HUMANOID STATE MORE AGGRESSIVELY
+		-- Disable ALL states that could interfere
 		humanoid:SetStateEnabled(Enum.HumanoidStateType.GettingUp, false)
 		humanoid:SetStateEnabled(Enum.HumanoidStateType.Jumping, false)
 		humanoid:SetStateEnabled(Enum.HumanoidStateType.Running, false)
 		humanoid:SetStateEnabled(Enum.HumanoidStateType.RunningNoPhysics, false)
-		humanoid:SetStateEnabled(Enum.HumanoidStateType.FallingDown, true)
-		humanoid:ChangeState(Enum.HumanoidStateType.Physics)
+		humanoid:SetStateEnabled(Enum.HumanoidStateType.Climbing, false)
+		humanoid:SetStateEnabled(Enum.HumanoidStateType.Swimming, false)
+		humanoid:SetStateEnabled(Enum.HumanoidStateType.Freefall, false)
+		humanoid:SetStateEnabled(Enum.HumanoidStateType.Landed, false)
+
+		-- Force physics state TWICE (Roblox sometimes ignores the first)
 		humanoid.PlatformStand = true
 		humanoid.AutoRotate = false
+		task.wait() -- Single frame yield to let state propagate
+		humanoid:ChangeState(Enum.HumanoidStateType.Physics)
+		humanoid.PlatformStand = true -- Set again after state change
 
 		-- Process motors INSTANTLY
 		local motors = getMotor6Ds(character)
@@ -677,7 +685,7 @@ end
 -- ============================================
 -- OPTIMIZED HITBOX SYSTEM
 -- ============================================
-local function createHitbox(abilityOwner, character, humanoidRootPart, vfxType)
+local function createHitbox(abilityOwner, character, humanoidRootPart, vfxType, customDuration)
 	if not character or not character.Parent then return end
 	if not humanoidRootPart or not humanoidRootPart.Parent then return end
 
@@ -685,10 +693,13 @@ local function createHitbox(abilityOwner, character, humanoidRootPart, vfxType)
 	if not abilityData then return end
 
 	pcall(function()
-		-- Create hitbox part
+		-- Determine if this is Final hit for special handling
+		local isFinalHit = (vfxType == Config.Network.Actions.Final)
+
+		-- Create hitbox part with dynamic size for Final hit
 		local hitbox = Instance.new("Part")
 		hitbox.Name = "SlashAbilityHitbox"
-		hitbox.Size = Config.Hitbox.Size
+		hitbox.Size = Config.Hitbox.Size -- Start at 6,6,6
 		hitbox.Anchored = true
 		hitbox.CanCollide = false
 		hitbox.CanTouch = false
@@ -699,7 +710,7 @@ local function createHitbox(abilityOwner, character, humanoidRootPart, vfxType)
 		-- Debug visualization
 		if Config.Hitbox.DebugVisualization then
 			hitbox.Transparency = Config.Hitbox.DebugTransparency
-			hitbox.Color = Color3.fromRGB(255, 0, 0)
+			hitbox.Color = isFinalHit and Color3.fromRGB(255, 255, 0) or Color3.fromRGB(255, 0, 0)
 			hitbox.Material = Enum.Material.ForceField
 		else
 			hitbox.Transparency = 1
@@ -707,6 +718,7 @@ local function createHitbox(abilityOwner, character, humanoidRootPart, vfxType)
 
 		-- Track hits for this specific hitbox
 		local hitboxHitPlayers = {}
+		local hitboxStartTime = tick()
 
 		-- Heartbeat connection for hitbox processing
 		local connection
@@ -723,6 +735,20 @@ local function createHitbox(abilityOwner, character, humanoidRootPart, vfxType)
 				return
 			end
 
+			-- FINAL HIT: Expand hitbox size over time (6,6,6 → 6,6,11)
+			if isFinalHit then
+				local elapsed = tick() - hitboxStartTime
+				local duration = customDuration or Config.Hitbox.Duration
+				local progress = math.min(elapsed / duration, 1)
+
+				-- Expand Z dimension from 6 to 11
+				local startZ = 6
+				local endZ = 11
+				local currentZ = startZ + (endZ - startZ) * progress
+
+				hitbox.Size = Vector3.new(6, 6, currentZ)
+			end
+
 			-- Update hitbox position
 			local lookVector = humanoidRootPart.CFrame.LookVector
 			local hitboxPosition = humanoidRootPart.Position + (lookVector * Config.Hitbox.ForwardOffset)
@@ -733,78 +759,91 @@ local function createHitbox(abilityOwner, character, humanoidRootPart, vfxType)
 			overlapParams.FilterType = Enum.RaycastFilterType.Exclude
 			overlapParams.FilterDescendantsInstances = {character, hitbox}
 
-			local partsInBox = workspace:GetPartBoundsInBox(hitbox.CFrame, Config.Hitbox.Size, overlapParams)
+			local partsInBox = workspace:GetPartBoundsInBox(hitbox.CFrame, hitbox.Size, overlapParams)
 
+			-- FIX #1: DEDUPLICATE TO ONE PART PER CHARACTER BEFORE PROCESSING
+			local charactersHit = {}
 			for _, part in ipairs(partsInBox) do
 				local targetCharacter = part.Parent
-				if targetCharacter and targetCharacter:FindFirstChild("Humanoid") then
-					local targetPlayer = Players:GetPlayerFromCharacter(targetCharacter)
+				if targetCharacter and targetCharacter:FindFirstChild("Humanoid") and not charactersHit[targetCharacter] then
+					charactersHit[targetCharacter] = part
+				end
+			end
 
-					if targetPlayer and targetPlayer ~= abilityOwner and not hitboxHitPlayers[targetPlayer] then
-						local targetHumanoid = targetCharacter:FindFirstChild("Humanoid")
+			-- Process each unique character hit
+			for targetCharacter, part in pairs(charactersHit) do
+				local targetPlayer = Players:GetPlayerFromCharacter(targetCharacter)
 
-						if targetHumanoid and targetHumanoid.Health > 0 then
-							-- Mark as hit by this hitbox
-							hitboxHitPlayers[targetPlayer] = true
+				if targetPlayer and targetPlayer ~= abilityOwner and not hitboxHitPlayers[targetPlayer] then
+					local targetHumanoid = targetCharacter:FindFirstChild("Humanoid")
 
-							-- Apply damage
-							targetHumanoid.Health = math.max(0, targetHumanoid.Health - Config.Combat.DamagePerHit)
+					if targetHumanoid and targetHumanoid.Health > 0 then
+						-- Mark as hit by this hitbox IMMEDIATELY
+						hitboxHitPlayers[targetPlayer] = true
 
-							-- SPECIAL HANDLING FOR FINAL HIT (FIXED CONSISTENCY)
-							if vfxType == Config.Network.Actions.Final then
-								print("Final hit detected on:", targetPlayer.Name)
+						-- Apply damage
+						targetHumanoid.Health = math.max(0, targetHumanoid.Health - Config.Combat.DamagePerHit)
 
-								-- Unlock if previously locked
-								if abilityData.hitPlayers[targetPlayer] then
-									local hitData = abilityData.hitPlayers[targetPlayer]
-									if hitData.lockData then
-										unlockTargetMovement(targetCharacter, hitData.lockData)
-									end
+						-- SPECIAL HANDLING FOR FINAL HIT (FIXED CONSISTENCY)
+						if isFinalHit then
+							-- FIX #5: Detailed debug logging
+							print("=== FINAL HIT DEBUG ===")
+							print("Target:", targetPlayer.Name)
+							print("Already ragdolled?:", ragdolledCharacters[targetCharacter] ~= nil)
+							print("Humanoid health:", targetHumanoid.Health)
+							print("Humanoid state:", targetHumanoid:GetState().Name)
+							print("Hitbox size at hit:", hitbox.Size)
+
+							-- Unlock if previously locked
+							if abilityData.hitPlayers[targetPlayer] then
+								local hitData = abilityData.hitPlayers[targetPlayer]
+								if hitData.lockData then
+									unlockTargetMovement(targetCharacter, hitData.lockData)
 								end
-
-								-- Apply ragdoll and knockback (INSTANT, NO DELAY)
-								knockbackAndRagdoll(targetCharacter, humanoidRootPart.Position)
-
-								-- Hit feedback
-								HitFeedback.FlickerHighlight(targetCharacter)
-
-								-- CRITICAL: Explicitly send Final VFX to the hit player so they see the effect!
-								slashAbilityEvent:FireClient(targetPlayer, vfxType, character)
-								print("Sent Final VFX to hit player:", targetPlayer.Name)
-
-								-- Mark as hit (no lock data, ragdoll handles movement)
-								abilityData.hitPlayers[targetPlayer] = {
-									character = targetCharacter,
-									humanoid = targetHumanoid,
-									lockData = nil
-								}
-							else
-								-- Normal hits: lock movement on first hit
-								if not abilityData.hitPlayers[targetPlayer] then
-									local lockData = lockTargetMovement(targetCharacter, targetHumanoid)
-									if lockData then
-										abilityData.hitPlayers[targetPlayer] = {
-											character = targetCharacter,
-											humanoid = targetHumanoid,
-											lockData = lockData
-										}
-									end
-								end
-
-								-- Apply smooth pushback
-								applyPushback(targetCharacter, humanoidRootPart)
-
-								-- Hit feedback
-								HitFeedback.FlickerHighlight(targetCharacter)
 							end
+
+							-- Apply ragdoll and knockback (INSTANT, NO DELAY)
+							knockbackAndRagdoll(targetCharacter, humanoidRootPart.Position)
+
+							-- Hit feedback
+							HitFeedback.FlickerHighlight(targetCharacter)
+
+							-- CRITICAL: Explicitly send Final VFX to the hit player so they see the effect!
+							slashAbilityEvent:FireClient(targetPlayer, vfxType, character)
+							print("Sent Final VFX to hit player:", targetPlayer.Name)
+
+							-- Mark as hit (no lock data, ragdoll handles movement)
+							abilityData.hitPlayers[targetPlayer] = {
+								character = targetCharacter,
+								humanoid = targetHumanoid,
+								lockData = nil
+							}
+						else
+							-- Normal hits: lock movement on first hit
+							if not abilityData.hitPlayers[targetPlayer] then
+								local lockData = lockTargetMovement(targetCharacter, targetHumanoid)
+								if lockData then
+									abilityData.hitPlayers[targetPlayer] = {
+										character = targetCharacter,
+										humanoid = targetHumanoid,
+										lockData = lockData
+									}
+								end
+							end
+
+							-- Apply smooth pushback
+							applyPushback(targetCharacter, humanoidRootPart)
+
+							-- Hit feedback
+							HitFeedback.FlickerHighlight(targetCharacter)
 						end
 					end
 				end
 			end
 		end)
 
-		-- Clean up hitbox after duration
-		task.delay(Config.Hitbox.Duration, function()
+		-- Clean up hitbox after duration (longer for Final hit)
+		task.delay(customDuration or Config.Hitbox.Duration, function()
 			connection:Disconnect()
 			if hitbox and hitbox.Parent then
 				hitbox:Destroy()
@@ -876,10 +915,12 @@ slashAbilityEvent.OnServerEvent:Connect(function(player, action, character)
 	abilityData.lastHitTime = tick()
 	abilityData.hitCount = abilityData.hitCount + 1
 
-	-- Create hitbox
+	-- Create hitbox (with extended duration for Final hit)
 	local humanoidRootPart = character:FindFirstChild("HumanoidRootPart")
 	if humanoidRootPart then
-		createHitbox(player, character, humanoidRootPart, action)
+		-- FIX #4: Extend duration for Final hit to ensure it connects
+		local duration = (action == Config.Network.Actions.Final) and 0.8 or nil
+		createHitbox(player, character, humanoidRootPart, action, duration)
 	end
 
 	-- Replicate to all other clients
