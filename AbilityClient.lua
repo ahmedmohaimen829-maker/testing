@@ -135,7 +135,10 @@ end
 -- ============================================
 local function playVFXForCharacter(targetCharacter, vfxType)
 	if not targetCharacter or not targetCharacter.Parent then return end
-	if targetCharacter == character then return end -- Don't play for self
+
+	-- REMOVED CHECK: Allow VFX for own character when explicitly sent by server
+	-- This is critical for Final hit VFX - victims need to see the effect!
+	-- The server explicitly sends Final VFX to hit players, even if it's their own character
 
 	local targetHumanoidRootPart = targetCharacter:FindFirstChild("HumanoidRootPart")
 	if not targetHumanoidRootPart then return end
@@ -176,7 +179,7 @@ local function playAnimation()
 
 	local success, err = pcall(function()
 		isPlaying = true
-		lastUseTime = currentTime
+		-- DON'T set lastUseTime here - wait until ability ends!
 
 		-- Clean up any active VFX
 		vfxHandler:CleanupAllVFX()
@@ -226,6 +229,9 @@ local function playAnimation()
 
 		-- Notify server
 		slashAbilityEvent:FireServer(Config.Network.Actions.AbilityEnd, character)
+
+		-- SET COOLDOWN HERE (when ability ends, not when it starts!)
+		lastUseTime = tick()
 
 		-- Unlock movement
 		setMovementLocked(false)

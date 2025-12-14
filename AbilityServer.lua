@@ -768,6 +768,10 @@ local function createHitbox(abilityOwner, character, humanoidRootPart, vfxType)
 								-- Hit feedback
 								HitFeedback.FlickerHighlight(targetCharacter)
 
+								-- CRITICAL: Explicitly send Final VFX to the hit player so they see the effect!
+								slashAbilityEvent:FireClient(targetPlayer, vfxType, character)
+								print("Sent Final VFX to hit player:", targetPlayer.Name)
+
 								-- Mark as hit (no lock data, ragdoll handles movement)
 								abilityData.hitPlayers[targetPlayer] = {
 									character = targetCharacter,
@@ -829,7 +833,7 @@ slashAbilityEvent.OnServerEvent:Connect(function(player, action, character)
 			return
 		end
 
-		playerCooldowns[player] = tick()
+		-- DON'T set cooldown here - wait until ability ends!
 
 		activeAbilities[player] = {
 			character = character,
@@ -853,6 +857,10 @@ slashAbilityEvent.OnServerEvent:Connect(function(player, action, character)
 			end
 
 			activeAbilities[player] = nil
+
+			-- SET COOLDOWN HERE (when ability ends, not when it starts!)
+			playerCooldowns[player] = tick()
+			print(string.format("[COOLDOWN] %s ability ended, cooldown set for %d seconds", player.Name, Config.Cooldown.Duration))
 		end
 		return
 	end
